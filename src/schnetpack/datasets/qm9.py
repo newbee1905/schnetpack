@@ -260,3 +260,5 @@ class QM9(AtomsDataModule):
         logging.info("Write atoms to db...")
         dataset.add_systems(property_list=property_list)
         logging.info("Done.")
+#
+# vim:ts=4 sw=4 et
