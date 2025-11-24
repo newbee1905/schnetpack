@@ -59,7 +59,7 @@ class QM9(AtomsDataModule):
         num_val: Optional[int] = None,
         num_test: Optional[int] = None,
         split_file: Optional[str] = "split.npz",
-        format: Optional[AtomsDataFormat] = AtomsDataFormat.ASE,
+        format: Optional[AtomsDataFormat] = None,
         load_properties: Optional[List[str]] = None,
         remove_uncharacterized: bool = False,
         val_batch_size: Optional[int] = None,
