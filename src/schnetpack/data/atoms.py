@@ -269,6 +269,12 @@ class ASEAtomsData(BaseAtomsData):
         return self.conn.count()
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        with self.env.begin(write=False) as txn:
+            data = txn.get(str(idx).encode("ascii"))
+
+        if data is None:
+            raise KeyError(f"Index {idx} not found in LMDB.")
+
         if self.subset_idx is not None:
             idx = self.subset_idx[idx]
 
@@ -276,6 +282,7 @@ class ASEAtomsData(BaseAtomsData):
             self.conn, idx, self.load_properties, self.load_structure
         )
         props = self._apply_transforms(props)
+
 
         return props
 
@@ -628,7 +635,6 @@ def resolve_format(
 
     """
     file, suffix = os.path.splitext(datapath)
-    print(file, suffix)
 
     if suffix == extension_map[AtomsDataFormat.ASE]:
         if format is None:
@@ -914,7 +920,6 @@ class LMDBAtomsData(BaseAtomsData):
             
         # Create a temporary instance and give it a persistent writable connection
         ds = LMDBAtomsData(datapath, **kwargs)
-        ds.env.close()
         
         # Re-open with writable access and map_size for subsequent additions
         ds.env = lmdb.open(
