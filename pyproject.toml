@@ -41,7 +41,11 @@ dependencies = [
     "tqdm",
     "pre-commit",
     "black",
-    "protobuf"
+    "protobuf",
+    "lmdb",
+    "pyserial",
+    "pytest-benchmark>=5.2.3",
+    "pytest>=9.0.2",
 ]
 
 [project.optional-dependencies]

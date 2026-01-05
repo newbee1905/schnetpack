@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 import torch
 from schnetpack.data import *
+from schnetpack.data import LMDBAtomsData 
 import schnetpack.properties as structure
 from schnetpack.data import AtomsDataModuleError, AtomsDataModule
 
@@ -58,7 +59,7 @@ class QM9(AtomsDataModule):
         num_val: Optional[int] = None,
         num_test: Optional[int] = None,
         split_file: Optional[str] = "split.npz",
-        format: Optional[AtomsDataFormat] = AtomsDataFormat.ASE,
+        format: Optional[AtomsDataFormat] = AtomsDataFormat.LMDB,
         load_properties: Optional[List[str]] = None,
         remove_uncharacterized: bool = False,
         val_batch_size: Optional[int] = None,
@@ -126,55 +127,116 @@ class QM9(AtomsDataModule):
 
         self.remove_uncharacterized = remove_uncharacterized
 
-    def prepare_data(self):
-        if not os.path.exists(self.datapath):
-            property_unit_dict = {
-                QM9.A: "GHz",
-                QM9.B: "GHz",
-                QM9.C: "GHz",
-                QM9.mu: "Debye",
-                QM9.alpha: "a0 a0 a0",
-                QM9.homo: "Ha",
-                QM9.lumo: "Ha",
-                QM9.gap: "Ha",
-                QM9.r2: "a0 a0",
-                QM9.zpve: "Ha",
-                QM9.U0: "Ha",
-                QM9.U: "Ha",
-                QM9.H: "Ha",
-                QM9.G: "Ha",
-                QM9.Cv: "cal/mol/K",
-            }
+    def _convert_ase_to_lmdb(self, ase_db_path: str, lmdb_path: str):
+        ase_dataset = load_dataset(ase_db_path, AtomsDataFormat.ASE)
 
-            tmpdir = tempfile.mkdtemp("qm9")
-            atomrefs = self._download_atomrefs(tmpdir)
+        property_unit_dict = ase_dataset.metadata["_property_unit_dict"]
+        distance_unit = ase_dataset.metadata["_distance_unit"]
+        atomrefs = ase_dataset.metadata["atomrefs"]
 
-            dataset = create_dataset(
-                datapath=self.datapath,
-                format=self.format,
-                distance_unit="Ang",
-                property_unit_dict=property_unit_dict,
-                atomrefs=atomrefs,
-            )
+        lmdb_dataset = create_dataset(
+            datapath=lmdb_path,
+            format=AtomsDataFormat.LMDB,
+            distance_unit=distance_unit,
+            property_unit_dict=property_unit_dict,
+            atomrefs=atomrefs,
+        )
 
-            if self.remove_uncharacterized:
-                uncharacterized = self._download_uncharacterized(tmpdir)
-            else:
-                uncharacterized = None
-            self._download_data(tmpdir, dataset, uncharacterized=uncharacterized)
-            shutil.rmtree(tmpdir)
+        all_properties = []
+        for i in tqdm(range(len(ase_dataset)), desc="Converting ASE to LMDB"):
+            data = ase_dataset[i]
+            properties = {k: v.numpy() for k, v in data.items() if k not in [structure.Z, structure.R, structure.cell, structure.pbc, structure.idx, structure.n_atoms]}
+            
+            # Extract structure properties and ensure they are numpy arrays
+            properties[structure.Z] = data[structure.Z].numpy()
+            properties[structure.R] = data[structure.R].numpy()
+            properties[structure.cell] = data[structure.cell].numpy().squeeze()
+            properties[structure.pbc] = data[structure.pbc].numpy()
+            all_properties.append(properties)
+
+        lmdb_dataset.add_systems(property_list=all_properties)
+        del ase_dataset # release the connection to the ase_db
+        
+
+    def _download_and_create_dataset(self, target_datapath: str, target_format: AtomsDataFormat):
+        property_unit_dict = {
+            QM9.A: "GHz",
+            QM9.B: "GHz",
+            QM9.C: "GHz",
+            QM9.mu: "Debye",
+            QM9.alpha: "a0 a0 a0",
+            QM9.homo: "Ha",
+            QM9.lumo: "Ha",
+            QM9.gap: "Ha",
+            QM9.r2: "a0 a0",
+            QM9.zpve: "Ha",
+            QM9.U0: "Ha",
+            QM9.U: "Ha",
+            QM9.H: "Ha",
+            QM9.G: "Ha",
+            QM9.Cv: "cal/mol/K",
+        }
+
+        tmpdir = tempfile.mkdtemp("qm9")
+        atomrefs = self._download_atomrefs(tmpdir)
+
+        dataset = create_dataset(
+            datapath=target_datapath,
+            format=target_format,
+            distance_unit="Ang",
+            property_unit_dict=property_unit_dict,
+            atomrefs=atomrefs,
+        )
+
+        if self.remove_uncharacterized:
+            uncharacterized = self._download_uncharacterized(tmpdir)
         else:
-            dataset = load_dataset(self.datapath, self.format)
-            if self.remove_uncharacterized and len(dataset) == 133885:
-                raise AtomsDataModuleError(
-                    "The dataset at the chosen location contains the uncharacterized 3054 molecules. "
-                    + "Choose a different location to reload the data or set `remove_uncharacterized=False`!"
+            uncharacterized = None
+        self._download_data(tmpdir, dataset, uncharacterized=uncharacterized)
+        shutil.rmtree(tmpdir)
+        
+    def prepare_data(self):
+        # Resolve the data path and format
+        original_datapath = self.datapath
+        db_path, db_format = resolve_format(self.datapath, self.format)
+        self.datapath = db_path
+        self.format = db_format
+
+        if not os.path.exists(self.datapath):
+            if self.format == AtomsDataFormat.LMDB:
+                ase_db_path = os.path.splitext(self.datapath)[0] + ".db"
+                if os.path.exists(ase_db_path):
+                    logging.info(
+                        f"Converting ASE DB at {ase_db_path} to LMDB at {self.datapath}..."
+                    )
+                    self._convert_ase_to_lmdb(ase_db_path, self.datapath)
+                    logging.info("Conversion complete.")
+                else:
+                    logging.info(
+                        f"Neither LMDB nor ASE DB found at {self.datapath} or {ase_db_path}. Downloading and creating new dataset."
+                    )
+                    self._download_and_create_dataset(self.datapath, self.format)
+            elif self.format == AtomsDataFormat.ASE:
+                logging.info(
+                    f"ASE DB not found at {self.datapath}. Downloading and creating new dataset."
                 )
-            elif not self.remove_uncharacterized and len(dataset) < 133885:
-                raise AtomsDataModuleError(
-                    "The dataset at the chosen location does NOT contain the uncharacterized 3054 molecules. "
-                    + "Choose a different location to reload the data or set `remove_uncharacterized=True`!"
-                )
+                self._download_and_create_dataset(self.datapath, self.format)
+            else:
+                raise AtomsDataModuleError(f"Unsupported format: {self.format}")
+        
+        # After ensuring the database exists, perform checks for uncharacterized molecules
+        dataset = load_dataset(self.datapath, self.format)
+
+        if self.remove_uncharacterized and len(dataset) == 133885:
+            raise AtomsDataModuleError(
+                "The dataset at the chosen location contains the uncharacterized 3054 molecules. "
+                + "Choose a different location to reload the data or set `remove_uncharacterized=False`!"
+            )
+        elif not self.remove_uncharacterized and len(dataset) < 133885:
+            raise AtomsDataModuleError(
+                "The dataset at the chosen location does NOT contain the uncharacterized 3054 molecules. "
+                + "Choose a different location to reload the data or set `remove_uncharacterized=True`!"
+            )
 
     def _download_uncharacterized(self, tmpdir):
         logging.info("Downloading list of uncharacterized molecules...")

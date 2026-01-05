@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 import schnetpack.properties as structure
-from schnetpack.data import AtomsLoader
+from schnetpack.data.loader import AtomsLoader
 
 __all__ = ["calculate_stats"]
 

@@ -13,7 +13,7 @@ defaults:
   - task: default_task
   - model: null
   - data: custom
-  - logger: tensorboard
+  - logger: wandb
   - experiment: null
 
 print_config: True

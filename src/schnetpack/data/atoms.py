@@ -26,11 +26,13 @@ import schnetpack as spk
 import schnetpack.properties as structure
 from schnetpack.transform import Transform
 
+from schnetpack.data.lmdb import LMDBAtomsData
+from schnetpack.data.base import BaseAtomsData, AtomsDataError
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ASEAtomsData",
-    "BaseAtomsData",
     "AtomsDataFormat",
     "resolve_format",
     "create_dataset",
@@ -42,146 +44,10 @@ class AtomsDataFormat(Enum):
     """Enumeration of data formats"""
 
     ASE = "ase"
+    LMDB = "lmdb"
 
 
-class AtomsDataError(Exception):
-    pass
-
-
-extension_map = {AtomsDataFormat.ASE: ".db"}
-
-
-class BaseAtomsData(ABC):
-    """
-    Base mixin class for atomistic data. Use together with PyTorch Dataset or
-    IterableDataset to implement concrete data formats.
-    """
-
-    def __init__(
-        self,
-        load_properties: Optional[List[str]] = None,
-        load_structure: bool = True,
-        transforms: Optional[List[Transform]] = None,
-        subset_idx: Optional[List[int]] = None,
-    ):
-        """
-        Args:
-            load_properties: Set of properties to be loaded and returned.
-                If None, all properties in the ASE dB will be returned.
-            load_structure: If True, load structure properties.
-            transforms: preprocessing transforms (see schnetpack.data.transforms)
-            subset: List of data indices.
-        """
-        self._transform_module = None
-        self.load_properties = load_properties
-        self.load_structure = load_structure
-        self.transforms = transforms
-        self.subset_idx = subset_idx
-
-    def __len__(self) -> int:
-        raise NotImplementedError
-
-    @property
-    def transforms(self):
-        return self._transforms
-
-    @transforms.setter
-    def transforms(self, value: Optional[List[Transform]]):
-        self._transforms = []
-        self._transform_module = None
-
-        if value is not None:
-            for tf in value:
-                self._transforms.append(tf)
-            self._transform_module = torch.nn.Sequential(*self._transforms)
-
-    def subset(self, subset_idx: List[int]):
-        assert (
-            subset_idx is not None
-        ), "Indices for creation of the subset need to be provided!"
-        ds = copy.copy(self)
-        if ds.subset_idx:
-            ds.subset_idx = [ds.subset_idx[i] for i in subset_idx]
-        else:
-            ds.subset_idx = subset_idx
-        return ds
-
-    @property
-    @abstractmethod
-    def available_properties(self) -> List[str]:
-        """Available properties in the dataset"""
-        pass
-
-    @property
-    @abstractmethod
-    def units(self) -> Dict[str, str]:
-        """Property to unit dict"""
-        pass
-
-    @property
-    def load_properties(self) -> List[str]:
-        """Properties to be loaded"""
-        if self._load_properties is None:
-            return self.available_properties
-        else:
-            return self._load_properties
-
-    @load_properties.setter
-    def load_properties(self, val: List[str]):
-        if val is not None:
-            props = self.available_properties
-            assert all(
-                [p in props for p in val]
-            ), "Not all given properties are available in the dataset!"
-        self._load_properties = val
-
-    @property
-    @abstractmethod
-    def metadata(self) -> Dict[str, Any]:
-        """Global metadata"""
-        pass
-
-    @property
-    @abstractmethod
-    def atomrefs(self) -> Dict[str, torch.Tensor]:
-        """Single-atom reference values for properties"""
-        pass
-
-    @abstractmethod
-    def update_metadata(self, **kwargs):
-        pass
-
-    @abstractmethod
-    def iter_properties(
-        self,
-        indices: Union[int, Iterable[int]] = None,
-        load_properties: List[str] = None,
-        load_structure: Optional[bool] = None,
-    ):
-        pass
-
-    @staticmethod
-    @abstractmethod
-    def create(
-        datapath: str,
-        position_unit: str,
-        property_unit_dict: Dict[str, str],
-        atomrefs: Dict[str, List[float]],
-        **kwargs,
-    ) -> "BaseAtomsData":
-        pass
-
-    @abstractmethod
-    def add_systems(
-        self,
-        property_list: List[Dict[str, Any]],
-        atoms_list: Optional[List[Atoms]] = None,
-    ):
-        pass
-
-    @abstractmethod
-    def add_system(self, atoms: Optional[Atoms] = None, **properties):
-        pass
+extension_map = {AtomsDataFormat.ASE: ".db", AtomsDataFormat.LMDB: ".lmdb"}
 
 
 class ASEAtomsData(BaseAtomsData):
@@ -223,7 +89,7 @@ class ASEAtomsData(BaseAtomsData):
         )
 
         self._check_db()
-        self.conn = connect(self.datapath, use_lock_file=False)
+        self.conn = None
 
         # initialize units
         md = self.metadata
@@ -264,6 +130,9 @@ class ASEAtomsData(BaseAtomsData):
             return conn.count()
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if self.conn is None:
+            self.conn = connect(self.datapath, use_lock_file=False)
+
         if self.subset_idx is not None:
             idx = self.subset_idx[idx]
 
@@ -559,6 +428,13 @@ def create_dataset(
             property_unit_dict=property_unit_dict,
             **kwargs,
         )
+    elif format is AtomsDataFormat.LMDB:
+        dataset = LMDBAtomsData.create(
+            datapath=datapath,
+            distance_unit=distance_unit,
+            property_unit_dict=property_unit_dict,
+            **kwargs,
+        )
     else:
         raise AtomsDataError(f"Unknown format: {format}")
     return dataset
@@ -576,6 +452,8 @@ def load_dataset(datapath: str, format: AtomsDataFormat, **kwargs) -> BaseAtomsD
     """
     if format is AtomsDataFormat.ASE:
         dataset = ASEAtomsData(datapath=datapath, **kwargs)
+    elif format is AtomsDataFormat.LMDB:
+        dataset = LMDBAtomsData(datapath=datapath, **kwargs)
     else:
         raise AtomsDataError(f"Unknown format: {format}")
     return dataset
@@ -600,6 +478,12 @@ def resolve_format(
         assert (
             format is AtomsDataFormat.ASE
         ), f"File extension {suffix} is not compatible with chosen format {format}"
+    elif suffix == ".lmdb":
+        if format is None:
+            format = AtomsDataFormat.LMDB
+        assert (
+            format is AtomsDataFormat.LMDB
+        ), f"File extension {suffix} is not compatible with chosen format {format}"
     elif len(suffix) == 0 and format:
         datapath = datapath + extension_map[format]
     elif len(suffix) == 0 and format is None:
@@ -607,5 +491,5 @@ def resolve_format(
             "If format is not given, `datapath` needs a supported file extension!"
         )
     else:
-        raise AtomsDataError(f"Unsupported file extension: {suffix}")
+        raise AtomsDataError(f"Unsupported file extension: {suffix}. Should be one of ['.db', '.lmdb']")
     return datapath, format

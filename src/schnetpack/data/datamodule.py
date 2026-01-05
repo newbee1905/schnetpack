@@ -9,16 +9,15 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import BatchSampler
 
-from schnetpack.data import (
+from schnetpack.data.atoms import (
     AtomsDataFormat,
     resolve_format,
     load_dataset,
-    BaseAtomsData,
-    AtomsLoader,
-    calculate_stats,
-    SplittingStrategy,
-    RandomSplit,
 )
+from schnetpack.data.splitting import SplittingStrategy, RandomSplit
+from schnetpack.data.base import BaseAtomsData
+from schnetpack.data.loader import AtomsLoader
+from schnetpack.data.stats import calculate_stats
 
 
 __all__ = ["AtomsDataModule", "AtomsDataModuleError"]
