@@ -46,6 +46,7 @@ dependencies = [
     "pyserial",
     "pytest-benchmark>=5.2.3",
     "pytest>=9.0.2",
+    "wandb>=0.23.1",
 ]
 
 [project.optional-dependencies]
