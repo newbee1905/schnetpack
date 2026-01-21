@@ -31,8 +31,18 @@ class QM9(AtomsDataModule):
 
     References:
 
-        .. [#qm9_1] https://springernature.figshare.com/ndownloader/files/3195404
+        .. [#qm9_1] https://ndownloader.figshare.com/files/3195404
     """
+
+    base_urls = [
+        "https://ndownloader.figshare.com/files/",
+        "https://springernature.figshare.com/ndownloader/files/",
+    ]
+    file_ids = {
+        "data": "3195389",
+        "atomrefs": "3195395",
+        "uncharacterized": "3195404",
+    }
 
     # properties
     A = "rotational_constant_A"
@@ -127,9 +137,40 @@ class QM9(AtomsDataModule):
 
         self.remove_uncharacterized = remove_uncharacterized
 
+    def _download_file(self, file_id: str, destination: str):
+        for base_url in self.base_urls:
+            url = f"{base_url}{file_id}"
+            try:
+                request.urlretrieve(url, destination)
+                return
+            except Exception:
+                logging.warning(f"Could not download from {url}, trying next source...")
+        raise AtomsDataModuleError(
+            f"Could not download file with id {file_id} from any source."
+        )
+
+    # def prepare_data(self):
+    #     if not os.path.exists(self.datapath):
+    #         property_unit_dict = {
+    #             QM9.A: "GHz",
+    #             QM9.B: "GHz",
+    #             QM9.C: "GHz",
+    #             QM9.mu: "Debye",
+    #             QM9.alpha: "a0 a0 a0",
+    #             QM9.homo: "Ha",
+    #             QM9.lumo: "Ha",
+    #             QM9.gap: "Ha",
+    #             QM9.r2: "a0 a0",
+    #             QM9.zpve: "Ha",
+    #             QM9.U0: "Ha",
+    #             QM9.U: "Ha",
+    #             QM9.H: "Ha",
+    #             QM9.G: "Ha",
+    #             QM9.Cv: "cal/mol/K",
+    #         }
+
     def _convert_ase_to_lmdb(self, ase_db_path: str, lmdb_path: str):
         ase_dataset = load_dataset(ase_db_path, AtomsDataFormat.ASE)
-
         property_unit_dict = ase_dataset.metadata["_property_unit_dict"]
         distance_unit = ase_dataset.metadata["_distance_unit"]
         atomrefs = ase_dataset.metadata["atomrefs"]
@@ -240,9 +281,8 @@ class QM9(AtomsDataModule):
 
     def _download_uncharacterized(self, tmpdir):
         logging.info("Downloading list of uncharacterized molecules...")
-        at_url = "https://springernature.figshare.com/ndownloader/files/3195404"
         tmp_path = os.path.join(tmpdir, "uncharacterized.txt")
-        request.urlretrieve(at_url, tmp_path)
+        self._download_file(self.file_ids["uncharacterized"], tmp_path)
         logging.info("Done.")
 
         uncharacterized = []
@@ -254,9 +294,8 @@ class QM9(AtomsDataModule):
 
     def _download_atomrefs(self, tmpdir):
         logging.info("Downloading GDB-9 atom references...")
-        at_url = "https://springernature.figshare.com/ndownloader/files/3195395"
         tmp_path = os.path.join(tmpdir, "atomrefs.txt")
-        request.urlretrieve(at_url, tmp_path)
+        self._download_file(self.file_ids["atomrefs"], tmp_path)
         logging.info("Done.")
 
         props = [QM9.zpve, QM9.U0, QM9.U, QM9.H, QM9.G, QM9.Cv]
@@ -275,9 +314,7 @@ class QM9(AtomsDataModule):
         logging.info("Downloading GDB-9 data...")
         tar_path = os.path.join(tmpdir, "gdb9.tar.gz")
         raw_path = os.path.join(tmpdir, "gdb9_xyz")
-        url = "https://springernature.figshare.com/ndownloader/files/3195389"
-
-        request.urlretrieve(url, tar_path)
+        self._download_file(self.file_ids["data"], tar_path)
         logging.info("Done.")
 
         logging.info("Extracting files...")
