@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+import torch
+import hydra
+from omegaconf import OmegaConf, DictConfig
+import logging
+import argparse
+import os
+import os
+import glob
+from typing import Optional, List, Dict
+
+# SchNetPack imports
+from schnetpack.utils import load_model, as_dtype
+from schnetpack.transform import MatScipyNeighborList, ASENeighborList, RemoveOffsets, AddOffsets
+import schnetpack.properties as properties
+from schnetpack.task import AtomisticTask
+import schnetpack.datasets
+from schnetpack.data import AtomsDataModule
+
+
+log = logging.getLogger(__name__)
+
+
+class PortableModel(torch.nn.Module):
+    """
+    A wrapper that bundles preprocessing transforms and a trained model into a single
+    scriptable module.
+
+    Args:
+        transforms (list): A list of SchNetPack transform objects.
+        model (schnetpack.model.AtomisticModel): The trained SchNetPack model.
+    """
+
+    def __init__(self, transforms: list, model: torch.nn.Module):
+        super().__init__()
+
+        # Sanity check for non-scriptable transforms that rely on external libraries
+        unscriptable = []
+        for t in transforms:
+            if isinstance(t, (MatScipyNeighborList, ASENeighborList)):
+                unscriptable.append(type(t).__name__)
+        if unscriptable:
+            raise TypeError(
+                f"The following transforms in your config are not scriptable: {', '.join(unscriptable)}. "
+                f"They rely on external libraries (SciPy/ASE) for neighbor list computation. "
+                f"To create a portable model, please use `schnetpack.transform.TorchNeighborList`."
+            )
+
+        self.preprocessing = torch.nn.ModuleList(transforms)
+        self.model = model
+
+    def forward(
+        self,
+        Z: torch.Tensor,
+        R: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
+        pbc: Optional[torch.Tensor] = None,
+    ):
+        """
+        Takes basic atomic data as tensors and returns model predictions.
+
+        Args:
+            Z (torch.Tensor): Atomic numbers, shape (n_atoms,).
+            R (torch.Tensor): Atomic positions, shape (n_atoms, 3).
+            cell (torch.Tensor, optional): Simulation cell, shape (3, 3).
+            pbc (torch.Tensor, optional): Periodic boundary conditions, shape (3,).
+
+        Returns:
+            dict[str, torch.Tensor]: A dictionary of predicted properties.
+        """
+
+        # Create the initial input dictionary required by SchNetPack transforms,
+        # replicating what AtomsConverter + _atoms_collate_fn do for a single molecule.
+        inputs = {
+            properties.Z: Z,
+            properties.R: R,
+            properties.n_atoms: torch.tensor(
+                [Z.shape[0]], device=Z.device, dtype=torch.long
+            ),
+            properties.idx: torch.tensor([0], device=Z.device, dtype=torch.long),
+            properties.idx_m: torch.zeros(
+                Z.shape[0], dtype=torch.long, device=Z.device
+            ),
+        }
+        if cell is not None:
+            inputs[properties.cell] = cell.view(1, 3, 3)
+        if pbc is not None:
+            inputs[properties.pbc] = pbc.view(1, 3)
+
+        # Apply all preprocessing transforms
+        processed_inputs = inputs
+        for transform in self.preprocessing:
+            processed_inputs = transform(processed_inputs)
+        
+        return self.model(processed_inputs)
+
+
+def main():
+    """
+    Create a portable TorchScript model by bundling a trained SchNetPack model
+    with its preprocessing transforms, using the configuration from the training run.
+    """
+    parser = argparse.ArgumentParser(
+        description="Create a portable TorchScript model from a training run directory."
+    )
+    parser.add_argument(
+        "run_dir", help="Path to the training run directory (e.g., runs/some_uuid)."
+    )
+    parser.add_argument("output_path", help="Path to save the portable model.")
+    args = parser.parse_args()
+
+    if os.path.isdir(args.output_path):
+        log.error(
+            f"Output path '{args.output_path}' is a directory. "
+            f"Please provide a full file path for the output model."
+        )
+        return
+
+    # Construct config path
+    run_dir = args.run_dir
+    config_path = os.path.join(run_dir, "config.yaml")
+
+    # Find the best checkpoint in the 'checkpoints' subfolder
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+    if not os.path.exists(checkpoints_dir):
+        log.error(f"Checkpoints directory not found at {checkpoints_dir}")
+        return
+
+    # Find the 'epoch=X.ckpt' file
+    checkpoint_files = glob.glob(os.path.join(checkpoints_dir, "epoch=*.ckpt"))
+
+    if not checkpoint_files:
+        log.error(f"No checkpoint files found in {checkpoints_dir}")
+        return
+    if len(checkpoint_files) > 1:
+        log.warning(f"Multiple checkpoint files found in {checkpoints_dir}. Using the first one: {checkpoint_files[0]}")
+
+    model_path = checkpoint_files[0]
+
+    if not os.path.exists(config_path):
+        log.error(f"Could not find config.yaml at {config_path}")
+        return
+
+    log.info(f"Loading training configuration from: {config_path}")
+    cfg = OmegaConf.load(config_path)
+
+    # Manually resolve run.work_dir and run.data_dir for standalone execution
+    # This replaces `${hydra:runtime.cwd}` and its derivatives that cause issues
+    # when not running under a full Hydra context.
+    cwd = os.getcwd()
+    if "run" not in cfg:
+        cfg.run = OmegaConf.create()
+    cfg.run.work_dir = cwd
+    cfg.run.data_dir = os.path.join(cwd, "data")
+
+
+    log.info(f"Loading model from: {model_path}")
+    try:
+        # Note: we load the task to get the model, as checkpoints are saved for the task
+        task = AtomisticTask.load_from_checkpoint(model_path)
+        model = task.model
+    except Exception as e:
+        log.error(f"Error loading model file: {e}")
+        return
+
+    # Set model to evaluation mode for deterministic output and to disable layers
+    # like dropout, which are only used during training.
+    log.info("Setting model to evaluation mode for deployment.")
+    model.eval()
+    # Enable inference mode to apply postprocessors
+    model._inference_mode = True
+    # Ensure postprocessors are active for deployment
+    model.do_postprocessing = True
+
+    # Move model to CPU to create a device-agnostic TorchScript model
+    log.info("Moving model to CPU for device-agnostic deployment...")
+    model.cpu()
+
+    atomrefs_from_dataset = {}
+    try:
+        log.info("Entering atomrefs loading block.")
+        # Resolve all variables in the data config
+        resolved_data_cfg = OmegaConf.to_container(cfg.data, resolve=True, throw_on_missing=False)
+        log.info(f"resolved_data_cfg: {resolved_data_cfg}")
+        if "_target_" in resolved_data_cfg:
+            log.info(f"resolved_data_cfg['_target_']: {resolved_data_cfg['_target_']}")
+        
+        # Check if the data config has a target for instantiation
+        if resolved_data_cfg and "_target_" in resolved_data_cfg:
+            # We must set num_workers to 0 to avoid multiprocessing issues during script.
+            original_num_workers = resolved_data_cfg.get("num_workers", 0)
+            original_num_val_workers = resolved_data_cfg.get("num_val_workers", 0)
+            original_num_test_workers = resolved_data_cfg.get("num_test_workers", 0)
+            
+            resolved_data_cfg["num_workers"] = 0
+            resolved_data_cfg["num_val_workers"] = 0
+            resolved_data_cfg["num_test_workers"] = 0
+            
+            data_module = hydra.utils.instantiate(resolved_data_cfg, _convert_="all")
+            log.info("After data_module instantiation.")
+
+            # Now, check if the instantiated object is an AtomsDataModule before proceeding with atomref loading
+            if isinstance(data_module, AtomsDataModule):
+                log.info("Attempting to load atomrefs from training data module...")
+                data_module.prepare_data()
+                log.info("After data_module.prepare_data().")
+                data_module.setup("fit")
+                log.info("After data_module.setup('fit').")
+
+                log.info(f"Checking data_module.train_dataset for atomrefs. hasattr: {hasattr(data_module.train_dataset, 'atomrefs')}")
+                if hasattr(data_module.train_dataset, "atomrefs"):
+                    log.info(f"data_module.train_dataset.atomrefs content: {data_module.train_dataset.atomrefs}")
+                    
+                    if data_module.train_dataset.atomrefs is not None:
+                        for prop, refs in data_module.train_dataset.atomrefs.items():
+                            atomrefs_from_dataset[prop] = refs # refs is already a torch.Tensor from BaseAtomsData.atomrefs property
+                        log.info(f"Successfully loaded atomrefs for properties: {list(atomrefs_from_dataset.keys())}")
+                    else:
+                        log.warning("Data module train_dataset.atomrefs attribute is empty.")
+                else:
+                    log.warning("Data module train_dataset does not have 'atomrefs' attribute.")
+                
+                # Restore original num_workers
+                resolved_data_cfg["num_workers"] = original_num_workers
+                resolved_data_cfg["num_val_workers"] = original_num_val_workers
+                resolved_data_cfg["num_test_workers"] = original_num_test_workers
+            else:
+                log.info(f"Instantiated data object is not an AtomsDataModule ({type(data_module)}). Skipping atomrefs loading.")
+        else:
+            log.info("No data _target_ specified in config. Skipping data module instantiation for atomrefs.")
+
+    except Exception as e:
+        log.warning(f"Could not load atomrefs from data module: {e}. Proceeding without atomrefs for transforms.")
+        log.exception("Full traceback for atomrefs loading error:") # Add this line to print traceback
+
+    # This is the section where preprocessing transforms for the PortableModel are instantiated.
+    # The atomrefs_from_dataset is now populated above and used for injection.
+    transforms = []
+    try:
+        if "data" not in cfg or "transforms" not in cfg.data:
+            log.error("Could not find 'data.transforms' in the provided configuration.")
+            # Do not return here to allow model to be created without transforms if config is missing.
+            # return 
+        else:
+            for tconf_original in cfg.data.transforms: # Iterate over original config entries
+                tconf = OmegaConf.to_container(tconf_original, resolve=True) # Convert to dict
+                
+                # Handle Neighbor List replacement BEFORE instantiation
+                if tconf["_target_"] == "schnetpack.transform.MatScipyNeighborList":
+                    log.info("Replacing MatScipyNeighborList with TorchNeighborList for deployment.")
+                    tconf["_target_"] = "schnetpack.transform.TorchNeighborList"
+                elif tconf["_target_"] == "schnetpack.transform.ASENeighborList":
+                    log.info("Replacing ASENeighborList with TorchNeighborList for deployment.")
+                    tconf["_target_"] = "schnetpack.transform.TorchNeighborList"
+
+                # Remove atomrefs key from config for instantiation to avoid Hydra error
+                tconf.pop("atomrefs", None)
+
+                log.info(f"Instantiating transform with tconf: {tconf}") # New log
+
+                # Instantiate the transform
+                transform = hydra.utils.instantiate(tconf, _convert_="all")
+
+                # Manually inject atomrefs if it's an offset transform and atomrefs are available
+                if isinstance(transform, (RemoveOffsets, AddOffsets)):
+                    log.info(f"Transform property after instantiation (direct access): {transform._property}") # New log for direct access
+                    prop = transform._property # Direct access
+                    if prop and prop in atomrefs_from_dataset:
+                        refs_tensor = atomrefs_from_dataset[prop] # Already a tensor
+                        transform.register_buffer("atomref", refs_tensor)
+                        log.info(f"Manually injected atomrefs into {type(transform).__name__} for property '{prop}'.")
+                    else:
+                        log.warning(f"Atomrefs not found in dataset for property '{prop}' for {type(transform).__name__}. "
+                                    f"This transform might not function as intended without them.")
+                transforms.append(transform)
+
+        # Filtering transforms is still done here
+        log.info("Filtering transforms for deployment...")
+        filtered_transforms = []
+        skipped_transforms = ["RemoveOffsets"] # RemoveOffsets is now skipped from preprocessing
+        for t in transforms:
+            if t.__class__.__name__ in skipped_transforms:
+                log.info(
+                    f"Skipping '{t.__class__.__name__}' transform for deployment, "
+                    f"as it is assumed to operate on target values not present at inference time."
+                )
+            else:
+                filtered_transforms.append(t)
+        transforms = filtered_transforms
+        log.info(f"Final preprocessing transforms passed to PortableModel: {[type(t).__name__ for t in transforms]}")
+    except Exception as e:
+        log.error(f"Error instantiating transforms from config: {e}")
+        log.exception("Full traceback for transform instantiation error:") # Added traceback for this section
+        # return removed to allow model creation even if transforms fail to instantiate
+
+    log.info("Wrapping model and preprocessing transforms...")
+    try:
+        portable_model = PortableModel(transforms, model)
+
+        # --- Temporary Debug Forward Pass ---
+        log.info("Performing a debug forward pass to inspect intermediate values before TorchScript compilation...")
+        with torch.no_grad(): # No need to track gradients for this debug pass
+            # Create dummy inputs for debugging
+            # Using example from example_run_model.py (CCO molecule)
+            dummy_Z = torch.tensor([6, 6, 8, 1, 1, 1, 1, 1, 1], dtype=torch.long)
+            dummy_R = torch.randn(9, 3, dtype=torch.float32) * 1.0 # Random positions
+            dummy_cell = torch.tensor([[20.0, 0, 0], [0, 20.0, 0], [0, 0, 20.0]], dtype=torch.float32)
+            dummy_pbc = torch.tensor([True, True, True], dtype=torch.bool)
+
+            temp_inputs = {
+                properties.Z: dummy_Z,
+                properties.R: dummy_R,
+                properties.n_atoms: torch.tensor([dummy_Z.shape[0]], dtype=torch.long),
+                properties.idx: torch.tensor([0], dtype=torch.long),
+                properties.idx_m: torch.zeros(dummy_Z.shape[0], dtype=torch.long),
+            }
+            if dummy_cell is not None:
+                temp_inputs[properties.cell] = dummy_cell.view(1, 3, 3)
+            if dummy_pbc is not None:
+                temp_inputs[properties.pbc] = dummy_pbc.view(1, 3)
+
+            # Apply preprocessing transforms
+            debug_processed_inputs = temp_inputs
+            for transform in portable_model.preprocessing:
+                debug_processed_inputs = transform(debug_processed_inputs)
+            
+            log.info(f"DEBUG (PortableModel): Processed inputs keys after preprocessing: {debug_processed_inputs.keys()}")
+            if properties.offsets in debug_processed_inputs:
+                log.info(f"DEBUG (PortableModel): _offsets present in processed_inputs. Shape: {debug_processed_inputs[properties.offsets].shape}")
+            else:
+                log.warning("DEBUG (PortableModel): _offsets MISSING in processed_inputs after preprocessing!")
+
+            # Call the model's forward pass
+            debug_model_output = portable_model.model(debug_processed_inputs)
+            log.info(f"DEBUG (PortableModel): Model output keys after model call: {debug_model_output.keys()}")
+            
+            if "free_energy" in debug_model_output:
+                log.info(f"DEBUG (PortableModel): free_energy in model_output: {debug_model_output['free_energy']}")
+            else:
+                log.warning("DEBUG (PortableModel): free_energy not found in model_output.")
+        log.info("Debug forward pass completed.")
+        # --- End Temporary Debug Forward Pass ---
+        
+        scripted_model = torch.jit.script(portable_model)
+    except Exception as e:
+        log.error(
+            f"Could not create a portable model. This is likely due to an "
+            f"unscriptable operation in your model or transforms.\nDetails: {e}"
+        )
+        return
+
+    torch.jit.save(scripted_model, args.output_path)
+    log.info(f"\nSuccess! Portable model saved to: {args.output_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+# vim: set ft=python ts=4 sw=4 et tw=88:

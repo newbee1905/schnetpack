@@ -2,7 +2,7 @@
 
 defaults:
   - override /model: nnp
-  - override /model/representation: painn_small # Use the small painn model
+  - override /model/representation: painn # Use the small painn model
   - override /data: qm9
 
 run:
@@ -15,8 +15,8 @@ globals:
   aggregation: sum
 
 data:
-  datapath: ${run.data_dir}/qm9_painn_tblite.lmdb
-  optimize_geometries: True
+  datapath: ${run.data_dir}/qm9_painn.lmdb
+  optimize_geometries: False
   transforms:
     - _target_: schnetpack.transform.SubtractCenterOfMass
     - _target_: schnetpack.transform.RemoveOffsets

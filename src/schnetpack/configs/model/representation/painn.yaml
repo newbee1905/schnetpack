@@ -9,3 +9,5 @@ shared_filters: False
 cutoff_fn:
   _target_: schnetpack.nn.cutoff.CosineCutoff
   cutoff: ${globals.cutoff}
+
+use_glu_variant: True

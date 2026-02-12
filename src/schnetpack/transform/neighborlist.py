@@ -7,7 +7,7 @@ from matscipy.neighbours import neighbour_list as msp_neighbor_list
 from .base import Transform
 from dirsync import sync
 import numpy as np
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 __all__ = [
     "ASENeighborList",
@@ -134,7 +134,7 @@ class CachedNeighborList(Transform):
                     print(e)
         return inputs
 
-    def teardown(self):
+    def teardown(self) -> None:
         if not self.keep_cache and not self.preexisting_cache:
             try:
                 shutil.rmtree(self.cache_path)
@@ -179,8 +179,14 @@ class NeighborListTransform(Transform):
     ) -> Dict[str, torch.Tensor]:
         Z = inputs[properties.Z]
         R = inputs[properties.R]
-        cell = inputs[properties.cell].view(3, 3)
-        pbc = inputs[properties.pbc]
+
+        # Handle cases where cell and pbc are not provided (e.g. non-periodic systems)
+        if properties.cell in inputs:
+            cell = inputs[properties.cell].squeeze(0).view(3, 3)
+            pbc = inputs[properties.pbc].squeeze(0)
+        else:
+            cell = torch.zeros((3, 3), dtype=R.dtype, device=R.device)
+            pbc = torch.zeros(3, dtype=torch.bool, device=R.device)
 
         idx_i, idx_j, offset = self._build_neighbor_list(Z, R, cell, pbc, self._cutoff)
         inputs[properties.idx_i] = idx_i.detach()
@@ -205,7 +211,14 @@ class ASENeighborList(NeighborListTransform):
     Calculate neighbor list using ASE.
     """
 
-    def _build_neighbor_list(self, Z, positions, cell, pbc, cutoff):
+    def _build_neighbor_list(
+        self,
+        Z: torch.Tensor,
+        positions: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        cutoff: float,
+    ):
         at = Atoms(numbers=Z, positions=positions, cell=cell, pbc=pbc)
 
         idx_i, idx_j, S = ase_neighbor_list("ijS", at, cutoff, self_interaction=False)
@@ -225,7 +238,14 @@ class MatScipyNeighborList(NeighborListTransform):
     """
 
     def _build_neighbor_list(
-        self, Z, positions, cell, pbc, cutoff, eps=1e-6, buffer=1.0
+        self,
+        Z: torch.Tensor,
+        positions: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        cutoff: float,
+        eps: float = 1e-6,
+        buffer: float = 1.0,
     ):
         at = Atoms(numbers=Z, positions=positions, cell=cell, pbc=pbc)
 
@@ -302,7 +322,7 @@ class SkinNeighborList(Transform):
 
         return inputs
 
-    def reset(self):
+    def reset(self) -> None:
         self.previous_inputs = {}
 
     def _remove_neighbors_in_skin(
@@ -325,7 +345,9 @@ class SkinNeighborList(Transform):
 
         return inputs
 
-    def _update(self, inputs):
+    def _update(
+        self, inputs: Dict[str, torch.Tensor]
+    ) -> Tuple[bool, Dict[str, torch.Tensor]]:
         """Make sure the list is up-to-date."""
 
         # get sample index
@@ -364,7 +386,7 @@ class SkinNeighborList(Transform):
         inputs = self._build(inputs)
         return True, inputs
 
-    def _build(self, inputs):
+    def _build(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 
         # apply all transforms to obtain new neighbor list
         inputs = self.neighbor_list(inputs)
@@ -396,7 +418,14 @@ class TorchNeighborList(NeighborListTransform):
         https://github.com/aiqm/torchani/blob/master/torchani/aev.py
     """
 
-    def _build_neighbor_list(self, Z, positions, cell, pbc, cutoff):
+    def _build_neighbor_list(
+        self,
+        Z: torch.Tensor,
+        positions: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        cutoff: float,
+    ):
         # Check if shifts are needed for periodic boundary conditions
         if torch.all(pbc == 0):
             shifts = torch.zeros(0, 3, device=cell.device, dtype=torch.long)
@@ -419,7 +448,7 @@ class TorchNeighborList(NeighborListTransform):
 
         return idx_i, idx_j, offset
 
-    def _get_neighbor_pairs(self, positions, cell, shifts, cutoff):
+    def _get_neighbor_pairs(self, positions: torch.Tensor, cell: torch.Tensor, shifts: torch.Tensor, cutoff: float):
         """Compute pairs of atoms that are neighbors
         Copyright 2018- Xiang Gao and other ANI developers
         (https://github.com/aiqm/torchani/blob/master/torchani/aev.py)
@@ -457,7 +486,7 @@ class TorchNeighborList(NeighborListTransform):
 
         # 5) Compute distances, and find all pairs within cutoff
         distances = torch.norm(Rij_all, dim=1)
-        in_cutoff = torch.nonzero(distances < cutoff, as_tuple=False)
+        in_cutoff = torch.nonzero(distances < cutoff)
 
         # 6) Reduce tensors to relevant components
         pair_index = in_cutoff.squeeze()
@@ -467,7 +496,7 @@ class TorchNeighborList(NeighborListTransform):
 
         return atom_index_i, atom_index_j, offsets
 
-    def _get_shifts(self, cell, pbc, cutoff):
+    def _get_shifts(self, cell: torch.Tensor, pbc: torch.Tensor, cutoff: float):
         """Compute the shifts of unit cell along the given cell vectors to make it
         large enough to contain all pairs of neighbor atoms with PBC under
         consideration.
@@ -487,7 +516,7 @@ class TorchNeighborList(NeighborListTransform):
 
         num_repeats = torch.ceil(cutoff * inverse_lengths).long()
         num_repeats = torch.where(
-            pbc, num_repeats, torch.Tensor([0], device=cell.device).long()
+            pbc, num_repeats, torch.tensor([0], device=cell.device).long()
         )
 
         r1 = torch.arange(1, num_repeats[0] + 1, device=cell.device)

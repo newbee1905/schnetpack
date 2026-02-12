@@ -1,0 +1,3 @@
+[submodule "external/tblite"]
+	path = external/tblite
+	url = https://github.com/tblite/tblite

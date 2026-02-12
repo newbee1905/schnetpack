@@ -27,6 +27,9 @@ class PaiNNInteraction(nn.Module):
         if self.use_norm:
             self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
             self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_mu = nn.Identity()
 
         self.interatomic_context_net = nn.Sequential(
             snn.Dense(n_atom_basis, n_atom_basis, activation=activation, use_glu_variant=use_glu_variant),
@@ -98,6 +101,9 @@ class PaiNNMixing(nn.Module):
         if self.use_norm:
             self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
             self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_mu = nn.Identity()
 
         self.intraatomic_context_net = nn.Sequential(
             snn.Dense(2 * n_atom_basis, n_atom_basis, activation=activation, use_glu_variant=use_glu_variant),

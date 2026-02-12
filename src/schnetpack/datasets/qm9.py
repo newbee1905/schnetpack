@@ -19,7 +19,109 @@ from schnetpack.data import LMDBAtomsData
 import schnetpack.properties as structure
 from schnetpack.data import AtomsDataModuleError, AtomsDataModule
 
+# Imports for TBLite optimization
+try:
+    from tblite.ase import TBLite
+    from ase.optimize import LBFGS
+    from rdkit import Chem
+    from openbabel import openbabel
+    from io import StringIO
+    TBLITE_AVAILABLE = True
+except ImportError as e:
+    TBLITE_AVAILABLE = False
+    TBLITE_IMPORT_ERROR = e
+    TBLite, LBFGS, Chem, openbabel, StringIO = None, None, None, None, None
+
 __all__ = ["QM9"]
+
+def _optimize_molecule_worker(task_data):
+    """
+    Worker function to perform TBLite optimization for a single molecule.
+    """
+    import logging
+    # Local imports for worker process, ensuring they are available in each process
+    # This avoids issues with non-picklable objects if imported globally.
+    try:
+        from tblite.ase import TBLite
+        from ase.optimize import LBFGS
+        from rdkit import Chem
+        from openbabel import openbabel
+        from io import StringIO
+        from ase.io import write as ase_write_io
+        from ase.io.extxyz import read_xyz
+        from ase import Atoms
+        import schnetpack.properties as structure
+    except ImportError as e:
+        # If imports fail in worker, it means TBLite is not truly available
+        # even if global_TBLITE_AVAILABLE was True due to different environments.
+        logging.error(f"Failed to import TBLite/ASE/RDKit/OpenBabel in worker process: {e}")
+        # Signal failure to main process
+        return task_data[0], None, None # idx, final_ats, properties
+    
+    (idx, xyzfile_lines, available_properties, optimize_geometries_flag, 
+     global_TBLITE_AVAILABLE, global_TBLITE_IMPORT_ERROR) = task_data
+
+    properties = {}
+    # Parse properties from the second line of the XYZ file
+    l = xyzfile_lines[1].split()[2:]
+    for pn, p in zip(available_properties, l):
+        properties[pn] = np.array([float(p)])
+
+    tmp = StringIO("".join(xyzfile_lines).replace("*^", "e"))
+    tmp.seek(0)
+    ats: Atoms = list(read_xyz(tmp, 0))[0]
+
+    final_ats = ats
+
+    if optimize_geometries_flag and global_TBLITE_AVAILABLE:
+        if not global_TBLITE_AVAILABLE:
+            # This case should ideally not happen if global_TBLITE_AVAILABLE is correctly checked
+            logging.warning(
+                f"TBLite optimization requested for molecule {idx}, but TBLite is not available in worker. "
+                "Skipping optimization and using original geometry."
+            )
+        else:
+            try:
+                # Convert ASE Atoms to XYZ string
+                tmp_xyz_io = StringIO()
+                ase_write_io(tmp_xyz_io, ats, format="xyz")
+                xyz_str = tmp_xyz_io.getvalue()
+
+                # Convert XYZ string to OpenBabel OBMol
+                ob_conversion = openbabel.OBConversion()
+                ob_conversion.SetInFormat("xyz")
+                ob_mol = openbabel.OBMol()
+                ob_conversion.ReadString(ob_mol, xyz_str)
+                
+                # Use MMFF94 for an initial guess
+                ff = openbabel.OBForceField.FindForceField("mmff94")
+                if ff is None:
+                    raise RuntimeError("Could not find MMFF94 force field. Check Open Babel installation.")
+                ff.Setup(ob_mol)
+                ff.SteepestDescent(2500)
+                ff.GetCoordinates(ob_mol)
+
+                # Convert optimized OBMol back to XYZ string for ASE
+                ob_conversion.SetOutFormat("xyz")
+                optimized_xyz_str = ob_conversion.WriteString(ob_mol)
+
+                # Read into ASE Atoms object for TBLite optimization
+                optimized_ats = list(read_xyz(StringIO(optimized_xyz_str), 0))[0]
+                optimized_ats.calc = TBLite()
+                dyn = LBFGS(optimized_ats)
+                dyn.run(fmax=0.05)
+
+                final_ats = optimized_ats
+                final_ats.calc = None # Remove calculator before returning to main process
+
+            except Exception as e:
+                logging.warning(
+                    f"TBLite optimization failed for molecule {idx}. "
+                    f"Error: {e}. Using original geometry."
+                )
+
+    return idx, final_ats, properties
+
 
 
 class QM9(AtomsDataModule):
@@ -84,6 +186,7 @@ class QM9(AtomsDataModule):
         property_units: Optional[Dict[str, str]] = None,
         distance_unit: Optional[str] = None,
         data_workdir: Optional[str] = None,
+        optimize_geometries: bool = False,
         **kwargs,
     ):
         """
@@ -136,6 +239,7 @@ class QM9(AtomsDataModule):
         )
 
         self.remove_uncharacterized = remove_uncharacterized
+        self.optimize_geometries = optimize_geometries
 
     def _download_file(self, file_id: str, destination: str):
         for base_url in self.base_urls:
@@ -311,11 +415,13 @@ class QM9(AtomsDataModule):
     def _download_data(
         self, tmpdir, dataset: BaseAtomsData, uncharacterized: List[int]
     ):
+        logging.info("Starting _download_data()...")
         logging.info("Downloading GDB-9 data...")
         tar_path = os.path.join(tmpdir, "gdb9.tar.gz")
         raw_path = os.path.join(tmpdir, "gdb9_xyz")
+        logging.info("Calling _download_file for data...")
         self._download_file(self.file_ids["data"], tar_path)
-        logging.info("Done.")
+        logging.info("Done downloading GDB-9 data.")
 
         logging.info("Extracting files...")
         tar = tarfile.open(tar_path)
@@ -328,32 +434,59 @@ class QM9(AtomsDataModule):
             os.listdir(raw_path), key=lambda x: (int(re.sub("\D", "", x)), x)
         )
 
-        property_list = []
-
+        # Prepare tasks for the multiprocessing pool
+        tasks = []
         irange = np.arange(len(ordered_files), dtype=int)
         if uncharacterized is not None:
             irange = np.setdiff1d(irange, np.array(uncharacterized, dtype=int) - 1)
 
-        for i in tqdm(irange):
+        # Collect all file contents to avoid workers reading files (might cause contention)
+        # This is a trade-off: more memory usage, but potentially faster I/O if files are small
+        file_contents_for_tasks = []
+        for i in irange: # Use irange to iterate over valid indices
             xyzfile = os.path.join(raw_path, ordered_files[i])
-            properties = {}
-
-            tmp = io.StringIO()
             with open(xyzfile, "r") as f:
-                lines = f.readlines()
-                l = lines[1].split()[2:]
-                for pn, p in zip(dataset.available_properties, l):
-                    properties[pn] = np.array([float(p)])
-                for line in lines:
-                    tmp.write(line.replace("*^", "e"))
+                file_contents_for_tasks.append((i, f.readlines())) # Store (original_idx, lines)
 
-            tmp.seek(0)
-            ats: Atoms = list(read_xyz(tmp, 0))[0]
-            properties[structure.Z] = ats.numbers
-            properties[structure.R] = ats.positions
-            properties[structure.cell] = ats.cell
-            properties[structure.pbc] = ats.pbc
-            property_list.append(properties)
+        if self.optimize_geometries and not TBLITE_AVAILABLE:
+            logging.error(
+                "TBLite optimization requested, but TBLite is not available. "
+                "Optimization will be skipped for all molecules."
+            )
+        
+        # Create tasks for the worker pool
+        tasks = []
+        for original_idx, lines in file_contents_for_tasks:
+            tasks.append(
+                (
+                    original_idx, 
+                    lines, 
+                    dataset.available_properties, 
+                    self.optimize_geometries, 
+                    TBLITE_AVAILABLE, 
+                    TBLITE_IMPORT_ERROR if not TBLITE_AVAILABLE else None
+                )
+            )
+
+        collected_properties = [] # Collect all properties here
+
+        for task in tqdm(tasks, desc="Processing molecules (TBLite optimization)"):
+            original_idx, final_ats, props = _optimize_molecule_worker(task)
+
+            if final_ats is None:  # Worker signaled an error (or TBLite not available)
+                logging.error(
+                    f"Worker failed to process molecule {original_idx}. Skipping this molecule."
+                )
+                continue
+
+            properties = props
+            properties[structure.Z] = final_ats.numbers
+            properties[structure.R] = final_ats.positions
+            properties[structure.cell] = final_ats.cell
+            properties[structure.pbc] = final_ats.pbc
+            collected_properties.append(properties)
+
+        property_list = collected_properties
 
         logging.info("Write atoms to db...")
         dataset.add_systems(property_list=property_list)

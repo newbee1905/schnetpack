@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 from typing import Dict, Optional, List
 
@@ -59,6 +58,9 @@ class AtomisticModel(nn.Module):
 
     """
 
+    required_derivatives: List[str]
+    model_outputs: List[str]
+
     def __init__(
         self,
         postprocessors: Optional[List[Transform]] = None,
@@ -77,12 +79,11 @@ class AtomisticModel(nn.Module):
         self.input_dtype_str = input_dtype_str
         self.do_postprocessing = do_postprocessing
         self.postprocessors = nn.ModuleList(postprocessors)
-        self.required_derivatives: Optional[List[str]] = None
-        self.model_outputs: Optional[List[str]] = None
+        self.required_derivatives = []
+        self.model_outputs = []
         self.spk_version = spk.__version__
 
     def collect_derivatives(self) -> List[str]:
-        self.required_derivatives = None
         required_derivatives = set()
         for m in self.modules():
             if (
@@ -94,7 +95,6 @@ class AtomisticModel(nn.Module):
         self.required_derivatives = required_derivatives
 
     def collect_outputs(self) -> List[str]:
-        self.model_outputs = None
         model_outputs = set()
         for m in self.modules():
             if hasattr(m, "model_outputs") and m.model_outputs is not None:
@@ -105,9 +105,10 @@ class AtomisticModel(nn.Module):
     def initialize_derivatives(
         self, inputs: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        for p in self.required_derivatives:
-            if p in inputs.keys():
-                inputs[p].requires_grad_()
+        if len(self.required_derivatives) > 0:
+            for p in self.required_derivatives:
+                if p in inputs:
+                    inputs[p].requires_grad_()
         return inputs
 
     def initialize_transforms(self, datamodule):

@@ -26,12 +26,14 @@ class SubtractCenterOfMass(Transform):
 
     def __init__(self):
         super().__init__()
+        # Register atomic_masses as a buffer
+        self.register_buffer("atomic_masses_buffer", torch.tensor(atomic_masses, dtype=torch.float32))
 
     def forward(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        masses = torch.tensor(atomic_masses[inputs[structure.Z]])
+        masses = self.atomic_masses_buffer[inputs[structure.Z]]
         inputs[structure.position] -= (
             masses.unsqueeze(-1) * inputs[structure.position]
         ).sum(0) / masses.sum()
