@@ -31,7 +31,7 @@ class QM9(AtomsDataModule):
 
     References:
 
-        .. [#qm9_1] https://springernature.figshare.com/ndownloader/files/3195404
+        .. [#qm9_1] https://ndownloader.figshare.com/files/3195404
     """
 
     # properties
@@ -240,7 +240,7 @@ class QM9(AtomsDataModule):
 
     def _download_uncharacterized(self, tmpdir):
         logging.info("Downloading list of uncharacterized molecules...")
-        at_url = "https://springernature.figshare.com/ndownloader/files/3195404"
+        at_url = "https://ndownloader.figshare.com/files/3195404"
         tmp_path = os.path.join(tmpdir, "uncharacterized.txt")
         request.urlretrieve(at_url, tmp_path)
         logging.info("Done.")
@@ -254,7 +254,7 @@ class QM9(AtomsDataModule):
 
     def _download_atomrefs(self, tmpdir):
         logging.info("Downloading GDB-9 atom references...")
-        at_url = "https://springernature.figshare.com/ndownloader/files/3195395"
+        at_url = "https://ndownloader.figshare.com/files/3195395"
         tmp_path = os.path.join(tmpdir, "atomrefs.txt")
         request.urlretrieve(at_url, tmp_path)
         logging.info("Done.")
@@ -275,7 +275,7 @@ class QM9(AtomsDataModule):
         logging.info("Downloading GDB-9 data...")
         tar_path = os.path.join(tmpdir, "gdb9.tar.gz")
         raw_path = os.path.join(tmpdir, "gdb9_xyz")
-        url = "https://springernature.figshare.com/ndownloader/files/3195389"
+        url = "https://ndownloader.figshare.com/files/3195389"
 
         request.urlretrieve(url, tar_path)
         logging.info("Done.")
@@ -288,7 +288,7 @@ class QM9(AtomsDataModule):
 
         logging.info("Parse xyz files...")
         ordered_files = sorted(
-            os.listdir(raw_path), key=lambda x: (int(re.sub("\D", "", x)), x)
+            os.listdir(raw_path), key=lambda x: (int(re.sub(r"\D", "", x)), x)
         )
 
         property_list = []

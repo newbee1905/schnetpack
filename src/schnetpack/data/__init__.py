@@ -14,6 +14,5 @@ from .splitting import (
 )
 from .datamodule import AtomsDataModule, AtomsDataModuleError
 from .sampler import *
-from .lmdb import LMDBAtomsData
 from .base import BaseAtomsData, AtomsDataError
-
+from .lmdb import LMDBAtomsData

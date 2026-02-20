@@ -27,6 +27,9 @@ class LMDBAtomsData(BaseAtomsData):
         property_units: Optional[Dict[str, str]] = None,
         distance_unit: Optional[str] = None,
     ):
+        self._env = None
+        self._env_pid = None
+
         self.datapath = datapath
         super().__init__(
             load_properties=load_properties,
@@ -36,8 +39,6 @@ class LMDBAtomsData(BaseAtomsData):
         )
 
         self._check_db()
-        self._env = None
-        self._env_pid = None
 
         # initialize units
         md = self.metadata

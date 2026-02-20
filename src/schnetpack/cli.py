@@ -5,6 +5,7 @@ import tempfile
 import socket
 from typing import List
 import random
+import petname
 
 import torch
 import hydra
@@ -25,7 +26,8 @@ from schnetpack.utils import load_model
 log = logging.getLogger(__name__)
 
 
-OmegaConf.register_new_resolver("uuid", lambda x: str(uuid.uuid1()))
+OmegaConf.register_new_resolver("uuid", lambda x: str(uuid.uuid1()), use_cache=True)
+OmegaConf.register_new_resolver("petname", lambda: petname.generate())
 OmegaConf.register_new_resolver("tmpdir", tempfile.mkdtemp, use_cache=True)
 
 header = """
@@ -57,7 +59,7 @@ def train(config: DictConfig):
             f"""
         Config incomplete! You have to specify at least `data` and `model`!
         For an example, try one of our pre-defined experiments:
-        > spktrain data_dir=/data/will/be/here +experiment=qm9
+        > spktrain experiment=qm9_atomwise
         """
         )
         return
