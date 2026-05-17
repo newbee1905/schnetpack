@@ -157,7 +157,7 @@ def main():
     log.info(f"Loading model from: {model_path}")
     try:
         # Note: we load the task to get the model, as checkpoints are saved for the task
-        task = AtomisticTask.load_from_checkpoint(model_path)
+        task = AtomisticTask.load_from_checkpoint(model_path, weights_only=False)
         model = task.model
     except Exception as e:
         log.error(f"Error loading model file: {e}")
@@ -182,6 +182,14 @@ def main():
         # Resolve all variables in the data config
         resolved_data_cfg = OmegaConf.to_container(cfg.data, resolve=True, throw_on_missing=False)
         log.info(f"resolved_data_cfg: {resolved_data_cfg}")
+
+        # Force split_file to be the one in run_dir if it exists, to ensure compatibility
+        # with the model's training split.
+        run_dir_split = os.path.join(run_dir, "split.npz")
+        if os.path.exists(run_dir_split):
+            log.info(f"Found split.npz in run directory: {run_dir_split}. Using it.")
+            resolved_data_cfg["split_file"] = run_dir_split
+
         if "_target_" in resolved_data_cfg:
             log.info(f"resolved_data_cfg['_target_']: {resolved_data_cfg['_target_']}")
         
@@ -283,6 +291,11 @@ def main():
                 log.info(
                     f"Skipping '{t.__class__.__name__}' transform for deployment, "
                     f"as it is assumed to operate on target values not present at inference time."
+                )
+            elif hasattr(t, "r_key") and t.r_key != properties.R:
+                log.info(
+                    f"Skipping '{t.__class__.__name__}' transform with custom r_key='{t.r_key}' for deployment, "
+                    f"as this input is assumed to be a target value not present at inference time."
                 )
             else:
                 filtered_transforms.append(t)

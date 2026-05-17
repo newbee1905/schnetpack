@@ -31,7 +31,7 @@ def load_model(model_path, device="cpu", **kwargs):
         model.spk_version = "2.1.0"
         return model
 
-    model = torch.load(model_path, map_location=device, **kwargs)
+    model = torch.load(model_path, map_location=device, weights_only=False, **kwargs)
 
     if not hasattr(model, "spk_version"):
         # make warning that model has no version information

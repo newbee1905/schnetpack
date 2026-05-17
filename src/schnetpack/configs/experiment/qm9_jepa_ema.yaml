@@ -1,0 +1,45 @@
+# @package _global_
+
+defaults:
+  - qm9_jepa_detached
+
+run:
+  experiment: qm9_jepa_ema
+
+model:
+  _target_: schnetpack.atomistic.jepa.JEPATask
+  predictor:
+    _target_: schnetpack.atomistic.jepa.PaiNNPredictor
+    n_atom_basis: ${model.representation.n_atom_basis}
+    n_interactions: 1
+    radial_basis: ${model.representation.radial_basis}
+    cutoff_fn: ${model.representation.cutoff_fn}
+  output_modules:
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      detach_embeddings: False
+      predict_embeddings: True
+      lmbd: 10.0
+    - _target_: schnetpack.atomistic.Atomwise
+      output_key: ${globals.property}
+      n_in: ${model.representation.n_atom_basis}
+      aggregation_mode: ${globals.aggregation}
+
+task:
+  outputs:
+    - _target_: schnetpack.task.ModelOutput
+      name: ${globals.property}
+      loss_fn:
+        _target_: torch.nn.MSELoss
+      metrics:
+        mae:
+          _target_: torchmetrics.regression.MeanAbsoluteError
+      loss_weight: 1.
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      detach_embeddings: False
+      predict_embeddings: True
+      lmbd: 10.0
+      loss_weight: 0.1

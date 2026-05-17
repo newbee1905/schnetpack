@@ -8,7 +8,7 @@ from torch.nn.init import xavier_uniform_
 from torch.nn.init import zeros_
 
 
-__all__ = ["RMSNorm", "EquivariantRMSNorm", "Dense"]
+__all__ = ["RMSNorm", "EquivariantRMSNorm", "EquivariantLayerNorm", "Dense"]
 
 # RMSNorm from gemma
 # https://github.com/google/gemma_pytorch/blob/main/gemma/model.py
@@ -59,21 +59,21 @@ class EquivariantRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, mu):
-        # mu shape: [Batch, Atoms, 3, Features]
+        # mu shape: [..., 3, Features]
         mu_fp32 = mu.float()
 
-        # Compute Squared Norm of vectors first (Sum over spatial dim 2)
+        # Compute Squared Norm of vectors first (Sum over spatial dim -2)
         # This calculates (x^2 + y^2 + z^2) for every feature
-        # Shape: [Batch, Atoms, Features]
+        # Shape: [..., Features]
         vector_squared_norms = mu_fp32.pow(2).sum(dim=-2) 
 
         # Calculate Mean of the Squared Norms across features
-        # Shape: [Batch, Atoms, 1] (Broadcastable)
+        # Shape: [..., 1] (Broadcastable)
         variance = vector_squared_norms.mean(dim=-1, keepdim=True)
 
         # Create invariant scaler
         # We scale the vector by 1/RMS. This changes length, but not direction.
-        # [Batch, Atoms, 1] -> [Batch, Atoms, 1, 1]
+        # [..., 1] -> [..., 1, 1]
         inv_scale = torch.rsqrt(variance + self.eps).unsqueeze(-2)
 
         out = mu_fp32 * inv_scale
@@ -84,6 +84,56 @@ class EquivariantRMSNorm(nn.Module):
         else:
             out = out * self.weight
 
+        return out
+
+
+class EquivariantLayerNorm(nn.Module):
+    """
+    Equivariant LayerNorm that respects 3D vector geometry.
+    Instead of RMS, it uses Mean and Variance across features.
+    Centering is done by subtracting the mean vector across features.
+    """
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        add_unit_offset: bool = True,
+    ):
+        super().__init__()
+        self.register_buffer("eps", torch.tensor(float(eps)))
+        self.add_unit_offset = add_unit_offset
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, mu):
+        # mu shape: [..., 3, Features]
+        mu_fp32 = mu.float()
+
+        # Center the vectors across features
+        # Compute mean vector across feature channels: [..., 3, 1]
+        mean_mu = mu_fp32.mean(dim=-1, keepdim=True)
+        mu_centered = mu_fp32 - mean_mu
+
+        # Compute Squared Norm of centered vectors: [..., Features]
+        vector_squared_norms = mu_centered.pow(2).sum(dim=-2) 
+
+        # Calculate Mean of the Squared Norms across features (Variance)
+        # Shape: [..., 1]
+        variance = vector_squared_norms.mean(dim=-1, keepdim=True)
+
+        # Create invariant scaler
+        inv_scale = torch.rsqrt(variance + self.eps).unsqueeze(-2)
+
+        out = mu_centered * inv_scale
+        out = out.to(self.weight.dtype)
+
+        # Apply learned scaling
+        if self.add_unit_offset:
+            out = out * (1 + self.weight)
+        else:
+            out = out * self.weight
+        
+        # NOTE: No bias term here, as adding a constant scalar bias to vector components 
+        # is not rotationally equivariant.
         return out
 
 

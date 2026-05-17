@@ -28,6 +28,9 @@ class LMDBAtomsData(BaseAtomsData):
         distance_unit: Optional[str] = None,
     ):
         self.datapath = datapath
+        self._env = None
+        self._env_pid = None
+
         super().__init__(
             load_properties=load_properties,
             load_structure=load_structure,
@@ -36,8 +39,6 @@ class LMDBAtomsData(BaseAtomsData):
         )
 
         self._check_db()
-        self._env = None
-        self._env_pid = None
 
         # initialize units
         md = self.metadata
@@ -172,7 +173,14 @@ class LMDBAtomsData(BaseAtomsData):
     ):
         key = str(idx).encode("ascii")
         with self.env.begin() as txn:
-            data = pickle.loads(txn.get(key))
+            raw_data = txn.get(key)
+            if raw_data is None:
+                raise AtomsDataError(
+                    f"Index {idx} not found in LMDB database at {self.datapath}. "
+                    f"This might happen if the dataset has been modified or the split "
+                    f"is incompatible."
+                )
+            data = pickle.loads(raw_data)
 
         properties = {}
         properties[structure.idx] = torch.tensor([idx])

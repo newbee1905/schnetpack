@@ -105,7 +105,7 @@ class CachedNeighborList(Transform):
 
         # try to read cached NBL
         try:
-            data = torch.load(cache_file)
+            data = torch.load(cache_file, weights_only=False)
             inputs.update(data)
         except IOError:
             # acquire lock for caching
@@ -117,7 +117,7 @@ class CachedNeighborList(Transform):
             with lock:
                 # retry reading, in case other process finished in the meantime
                 try:
-                    data = torch.load(cache_file)
+                    data = torch.load(cache_file, weights_only=False)
                     inputs.update(data)
                 except IOError:
                     # now it is save to calculate and cache
@@ -165,20 +165,32 @@ class NeighborListTransform(Transform):
     def __init__(
         self,
         cutoff: float,
+        r_key: str = properties.R,
+        idx_i_key: str = properties.idx_i,
+        idx_j_key: str = properties.idx_j,
+        offsets_key: str = properties.offsets,
     ):
         """
         Args:
             cutoff: Cutoff radius for neighbor search.
+            r_key: Key of positions in inputs.
+            idx_i_key: Key of first neighbor index in inputs.
+            idx_j_key: Key of second neighbor index in inputs.
+            offsets_key: Key of cell offsets in inputs.
         """
         super().__init__()
         self._cutoff = cutoff
+        self.r_key = r_key
+        self.idx_i_key = idx_i_key
+        self.idx_j_key = idx_j_key
+        self.offsets_key = offsets_key
 
     def forward(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         Z = inputs[properties.Z]
-        R = inputs[properties.R]
+        R = inputs[self.r_key]
 
         # Handle cases where cell and pbc are not provided (e.g. non-periodic systems)
         if properties.cell in inputs:
@@ -189,9 +201,9 @@ class NeighborListTransform(Transform):
             pbc = torch.zeros(3, dtype=torch.bool, device=R.device)
 
         idx_i, idx_j, offset = self._build_neighbor_list(Z, R, cell, pbc, self._cutoff)
-        inputs[properties.idx_i] = idx_i.detach()
-        inputs[properties.idx_j] = idx_j.detach()
-        inputs[properties.offsets] = offset
+        inputs[self.idx_i_key] = idx_i.detach()
+        inputs[self.idx_j_key] = idx_j.detach()
+        inputs[self.offsets_key] = offset
         return inputs
 
     def _build_neighbor_list(
@@ -224,7 +236,8 @@ class ASENeighborList(NeighborListTransform):
         idx_i, idx_j, S = ase_neighbor_list("ijS", at, cutoff, self_interaction=False)
         idx_i = torch.from_numpy(idx_i)
         idx_j = torch.from_numpy(idx_j)
-        S = torch.from_numpy(S).to(dtype=positions.dtype)
+        S = torch.from_numpy(S).to(dtype=positions.dtype, device=positions.device)
+        cell = cell.to(dtype=positions.dtype, device=positions.device)
         offset = torch.mm(S, cell)
         return idx_i, idx_j, offset
 
@@ -261,7 +274,8 @@ class MatScipyNeighborList(NeighborListTransform):
         idx_i, idx_j, S = msp_neighbor_list("ijS", at, cutoff)
         idx_i = torch.from_numpy(idx_i).long()
         idx_j = torch.from_numpy(idx_j).long()
-        S = torch.from_numpy(S).to(dtype=positions.dtype)
+        S = torch.from_numpy(S).to(dtype=positions.dtype, device=positions.device)
+        cell = cell.to(dtype=positions.dtype, device=positions.device)
         offset = torch.mm(S, cell)
 
         return idx_i, idx_j, offset
@@ -489,7 +503,7 @@ class TorchNeighborList(NeighborListTransform):
         in_cutoff = torch.nonzero(distances < cutoff)
 
         # 6) Reduce tensors to relevant components
-        pair_index = in_cutoff.squeeze()
+        pair_index = in_cutoff.view(-1)
         atom_index_i = pi_all[pair_index]
         atom_index_j = pj_all[pair_index]
         offsets = shifts_all[pair_index]

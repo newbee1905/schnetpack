@@ -1,0 +1,99 @@
+# @package _global_
+
+defaults:
+  - qm9_jepa_detached
+
+run:
+  experiment: qm9_jepa_v2
+
+globals:
+  n_latent: 64
+
+model:
+  predictor:
+    _target_: schnetpack.atomistic.jepa.PaiNNLatentPredictor
+    n_atom_basis: ${model.representation.n_atom_basis}
+    n_layers: 3
+    kan_degree: null
+    use_glu_variant: True
+  detach_scalar_representation: False
+  train_on_pred: False
+  output_modules:
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      predict_embeddings: False
+      lmbd: 10.0
+      use_vector_loss: True
+      mlp_spec: "128-256-128"
+    - _target_: schnetpack.atomistic.JepaAtomwise
+      output_key: ${globals.property}
+      n_in: ${model.representation.n_atom_basis}
+      aggregation_mode: ${globals.aggregation}
+      latent_key: energy_latent
+      predictor: null
+      detach_latent: False
+    - _target_: schnetpack.atomistic.jepa.JepaLatentOutput
+      name: latent_match
+      latent_key: energy_latent
+      n_latents: ${globals.n_latent}
+      loss_weight: 0.1
+      mlp_spec: "64-128-64"
+
+task:
+  outputs:
+    - _target_: schnetpack.task.ModelOutput
+      name: ${globals.property}
+      loss_fn:
+        _target_: torch.nn.MSELoss
+      metrics:
+        mae:
+          _target_: torchmetrics.regression.MeanAbsoluteError
+        rmse:
+          _target_: torchmetrics.regression.MeanSquaredError
+          squared: False
+        mse:
+          _target_: torchmetrics.regression.MeanSquaredError
+      loss_weight: 1.
+    - _target_: schnetpack.atomistic.jepa.JepaModelOutput
+      name: ${globals.property}_real
+      target_property: ${globals.property}
+      loss_fn:
+        _target_: torch.nn.MSELoss
+      metrics:
+        mae:
+          _target_: torchmetrics.regression.MeanAbsoluteError
+        rmse:
+          _target_: torchmetrics.regression.MeanSquaredError
+          squared: False
+        mse:
+          _target_: torchmetrics.regression.MeanSquaredError
+      loss_weight: 1.
+    - _target_: schnetpack.atomistic.jepa.JepaModelOutput
+      name: ${globals.property}_smiles
+      target_property: ${globals.property}
+      loss_fn:
+        _target_: torch.nn.MSELoss
+      metrics:
+        mae:
+          _target_: torchmetrics.regression.MeanAbsoluteError
+        rmse:
+          _target_: torchmetrics.regression.MeanSquaredError
+          squared: False
+        mse:
+          _target_: torchmetrics.regression.MeanSquaredError
+      loss_weight: 1.
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      predict_embeddings: False
+      lmbd: 10.0
+      use_vector_loss: True
+      loss_weight: 0.1
+      mlp_spec: "128-256-128"
+    - _target_: schnetpack.atomistic.jepa.JepaLatentOutput
+      name: latent_match
+      latent_key: energy_latent
+      n_latents: ${globals.n_latent}
+      loss_weight: 0.1
+      mlp_spec: "64-128-64"

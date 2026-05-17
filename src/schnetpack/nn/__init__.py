@@ -13,3 +13,4 @@ from schnetpack.nn.scatter import *
 from schnetpack.nn.radial import *
 from schnetpack.nn.utils import *
 from schnetpack.nn.embedding import *
+from schnetpack.nn.kan import *

@@ -7,3 +7,4 @@ n_interactions: 6
 cutoff_fn:
   _target_: schnetpack.nn.cutoff.CosineCutoff
   cutoff: ${globals.cutoff}
+kan_degree: null

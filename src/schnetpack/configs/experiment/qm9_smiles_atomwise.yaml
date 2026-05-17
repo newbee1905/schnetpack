@@ -2,11 +2,10 @@
 
 defaults:
   - override /model: nnp
-  - override /model/representation: painn
-  - override /data: qm9
+  - override /data: qm9_smiles
 
 run:
-  experiment: qm9_painn_${globals.property} # changed experiment name
+  experiment: qm9_${globals.property}
 
 globals:
   cutoff: 5.
@@ -15,7 +14,6 @@ globals:
   aggregation: sum
 
 data:
-  datapath: ${run.data_dir}/qm9_painn.lmdb
   transforms:
     - _target_: schnetpack.transform.SubtractCenterOfMass
     - _target_: schnetpack.transform.RemoveOffsets

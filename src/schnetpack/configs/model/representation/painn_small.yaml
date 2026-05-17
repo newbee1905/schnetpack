@@ -11,3 +11,4 @@ cutoff_fn:
   cutoff: ${globals.cutoff}
 use_norm: True
 use_glu_variant: True
+kan_degree: null

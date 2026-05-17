@@ -5,8 +5,9 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 from typing import List, Optional, Dict
-from urllib import request as request
+import requests
 
 import numpy as np
 from ase import Atoms
@@ -19,18 +20,14 @@ from schnetpack.data import LMDBAtomsData
 import schnetpack.properties as structure
 from schnetpack.data import AtomsDataModuleError, AtomsDataModule
 
-# Imports for TBLite optimization
-try:
-    from tblite.ase import TBLite
-    from ase.optimize import LBFGS
-    from rdkit import Chem
-    from openbabel import openbabel
-    from io import StringIO
-    TBLITE_AVAILABLE = True
-except ImportError as e:
-    TBLITE_AVAILABLE = False
-    TBLITE_IMPORT_ERROR = e
-    TBLite, LBFGS, Chem, openbabel, StringIO = None, None, None, None, None
+from rdkit import Chem
+from openbabel import openbabel
+from io import StringIO
+
+from ase import Atoms
+from ase.optimize import LBFGS
+from ase.io import write as ase_write_io
+from ase.io.extxyz import read_xyz
 
 __all__ = ["QM9"]
 
@@ -38,28 +35,24 @@ def _optimize_molecule_worker(task_data):
     """
     Worker function to perform TBLite optimization for a single molecule.
     """
-    import logging
-    # Local imports for worker process, ensuring they are available in each process
-    # This avoids issues with non-picklable objects if imported globally.
-    try:
-        from tblite.ase import TBLite
-        from ase.optimize import LBFGS
-        from rdkit import Chem
-        from openbabel import openbabel
-        from io import StringIO
-        from ase.io import write as ase_write_io
-        from ase.io.extxyz import read_xyz
-        from ase import Atoms
-        import schnetpack.properties as structure
-    except ImportError as e:
-        # If imports fail in worker, it means TBLite is not truly available
-        # even if global_TBLITE_AVAILABLE was True due to different environments.
-        logging.error(f"Failed to import TBLite/ASE/RDKit/OpenBabel in worker process: {e}")
-        # Signal failure to main process
-        return task_data[0], None, None # idx, final_ats, properties
+    from openbabel import openbabel
+    from io import StringIO
+    from ase.io import write as ase_write_io
+    from ase.io.extxyz import read_xyz
+    from ase import Atoms
+    import schnetpack.properties as structure
+
+    import numpy as np
     
-    (idx, xyzfile_lines, available_properties, optimize_geometries_flag, 
-     global_TBLITE_AVAILABLE, global_TBLITE_IMPORT_ERROR) = task_data
+    (
+        idx,
+        xyzfile_lines,
+        available_properties,
+        optimize_geometries_flag,
+        use_smiles_flag,
+        distance_threshold,
+        store_both_flag,
+    ) = task_data
 
     properties = {}
     # Parse properties from the second line of the XYZ file
@@ -67,60 +60,195 @@ def _optimize_molecule_worker(task_data):
     for pn, p in zip(available_properties, l):
         properties[pn] = np.array([float(p)])
 
-    tmp = StringIO("".join(xyzfile_lines).replace("*^", "e"))
+    tmp_str = "".join(xyzfile_lines).replace("*^", "e")
+    tmp = StringIO(tmp_str)
     tmp.seek(0)
-    ats: Atoms = list(read_xyz(tmp, 0))[0]
 
-    final_ats = ats
+    original_ats: Atoms = list(read_xyz(tmp, 0))[0]
+    final_ats = original_ats.copy()
+    num_atoms = len(original_ats)
 
-    if optimize_geometries_flag and global_TBLITE_AVAILABLE:
-        if not global_TBLITE_AVAILABLE:
-            # This case should ideally not happen if global_TBLITE_AVAILABLE is correctly checked
-            logging.warning(
-                f"TBLite optimization requested for molecule {idx}, but TBLite is not available in worker. "
-                "Skipping optimization and using original geometry."
-            )
-        else:
-            try:
-                # Convert ASE Atoms to XYZ string
+    if use_smiles_flag:
+        try:
+            smiles = ""
+            # Extract SMILES directly from standard QM9 file footer
+            if len(xyzfile_lines) > num_atoms + 3:
+                smiles_line = xyzfile_lines[num_atoms + 3].strip()
+                if smiles_line and not smiles_line.replace(".", "").replace("-", "").isdigit():
+                    smiles = smiles_line.split()[0]
+
+            # Setup OpenBabel for SMILES conversion and mapping
+            tmp_xyz_io = StringIO()
+            ase_write_io(tmp_xyz_io, original_ats, format="xyz")
+            xyz_str = tmp_xyz_io.getvalue()
+
+            ob_conversion = openbabel.OBConversion()
+            ob_conversion.SetInFormat("xyz")
+            ob_mol = openbabel.OBMol()
+            ob_conversion.ReadString(ob_mol, xyz_str)
+
+            if not smiles:
                 tmp_xyz_io = StringIO()
-                ase_write_io(tmp_xyz_io, ats, format="xyz")
+                ase_write_io(tmp_xyz_io, original_ats, format="xyz")
                 xyz_str = tmp_xyz_io.getvalue()
 
-                # Convert XYZ string to OpenBabel OBMol
                 ob_conversion = openbabel.OBConversion()
                 ob_conversion.SetInFormat("xyz")
                 ob_mol = openbabel.OBMol()
                 ob_conversion.ReadString(ob_mol, xyz_str)
+
+                ob_conversion.SetOutFormat("can")
+                smiles = ob_conversion.WriteString(ob_mol).strip()
+
+            # Generate 3D structure from SMILES using Open Babel
+            ob_mol_smi = openbabel.OBMol()
+            ob_conversion.SetInFormat("smi")
+            ob_conversion.ReadString(ob_mol_smi, smiles)
+
+            ob_mol_smi.AddHydrogens()
+
+            builder = openbabel.OBBuilder()
+            builder.Build(ob_mol_smi)
+            
+            ff = openbabel.OBForceField.FindForceField("mmff94")
+            if ff is None:
+                raise ValueError("Could not find MMFF94 force field. Check Open Babel installation.")
+
+            ff.Setup(ob_mol_smi)
+            ff.SteepestDescent(500)
+            ff.GetCoordinates(ob_mol_smi)
+
+            # Convert Open Babel mol to RDKit mol to ensure consistent indexing
+            # for the isomorphism check while keeping OB coordinates.
+            ob_conversion.SetOutFormat("mol")
+            mol_block = ob_conversion.WriteString(ob_mol_smi)
+            mol_smi = Chem.MolFromMolBlock(mol_block, removeHs=False)
+            
+            if mol_smi is None:
+                raise ValueError(f"RDKit failed to import Open Babel mol block for SMILES: {smiles}")
+
+            # Extract final atoms from the RDKit-wrapped OB geometry
+            conf = mol_smi.GetConformer()
+            new_pos = conf.GetPositions()
+            new_z = [a.GetAtomicNum() for a in mol_smi.GetAtoms()]
+            final_ats = Atoms(numbers=new_z, positions=new_pos)
+
+            # Map original positions to new atom order if requested
+            if store_both_flag:
+                from rdkit.Chem import rdDetermineBonds
+
+                try:
+                    # Load the original XYZ into RDKit and perceive bonds
+                    tmp_io = StringIO()
+                    ase_write_io(tmp_io, original_ats, format="xyz")
+                    clean_xyz_block = tmp_io.getvalue()
+                    
+                    raw_mol_xyz = Chem.MolFromXYZBlock(clean_xyz_block)
+                    if raw_mol_xyz is None:
+                        raise ValueError("RDKit failed to parse the clean XYZ block.")
+
+                    rdDetermineBonds.DetermineConnectivity(raw_mol_xyz)
+                    rdDetermineBonds.DetermineBondOrders(raw_mol_xyz, charge=0)
+
+                    # Find mapping: SMILES indices (OB-ordered) -> XYZ indices
+                    matches = raw_mol_xyz.GetSubstructMatches(mol_smi, uniquify=False)
+
+                    if matches:
+                        orig_pos = original_ats.positions
+                        best_match = None
+                        min_rmsd = float('inf')
+                        
+                        # Center the SMILES conformer for alignment
+                        new_pos_centered = new_pos - np.mean(new_pos, axis=0)
+                        
+                        for match in matches:
+                            reordered_orig = orig_pos[list(match)]
+                            reordered_orig_centered = reordered_orig - np.mean(reordered_orig, axis=0)
+                            
+                            # Optimal rotation (Kabsch algorithm)
+                            cov = reordered_orig_centered.T @ new_pos_centered
+                            u, s, vh = np.linalg.svd(cov)
+                            d = np.linalg.det(u @ vh)
+                            if d < 0:
+                                u[:, -1] *= -1
+                            rot = u @ vh
+                            
+                            # Rotate original coordinates to match SMILES orientation
+                            aligned_orig = reordered_orig_centered @ rot
+                            
+                            rmsd = np.sqrt(np.mean((aligned_orig - new_pos_centered)**2))
+                            if rmsd < min_rmsd:
+                                min_rmsd = rmsd
+                                best_match = reordered_orig
+                                
+                        properties["R_real"] = best_match.astype(np.float32)
+                    else:
+                        raise ValueError(f"No graph isomorphism found between SMILES and original XYZ.")
+
+                except Exception as e:
+                    logging.warning(f"RDKit Alignment failed for molecule {idx}: {e}. Skipping molecule.")
+                    return idx, None, None, "alignment_failed"
+
+        except Exception as e:
+            logging.warning(
+                f"SMILES conversion failed for molecule {idx}. Error: {e}. Skipping molecule."
+            )
+            return idx, None, None, "smiles_failed"
+
+    if optimize_geometries_flag:
+        try:
+            # Convert current ASE Atoms (either original or SMILES-generated) to XYZ string
+            tmp_xyz_io = StringIO()
+            ase_write_io(tmp_xyz_io, final_ats, format="xyz")
+            xyz_str = tmp_xyz_io.getvalue()
+
+            # Convert XYZ string to OpenBabel OBMol
+            ob_conversion = openbabel.OBConversion()
+            ob_conversion.SetInFormat("xyz")
+            ob_mol = openbabel.OBMol()
+            ob_conversion.ReadString(ob_mol, xyz_str)
+
+            # Use MMFF94 force field for optimization via OpenBabel
+            ff = openbabel.OBForceField.FindForceField("mmff94")
+            if ff is None:
+                ff = openbabel.OBForceField.FindForceField("uff")
                 
-                # Use MMFF94 for an initial guess
-                ff = openbabel.OBForceField.FindForceField("mmff94")
-                if ff is None:
-                    raise RuntimeError("Could not find MMFF94 force field. Check Open Babel installation.")
-                ff.Setup(ob_mol)
-                ff.SteepestDescent(2500)
-                ff.GetCoordinates(ob_mol)
+            if ff is None:
+                raise RuntimeError("Could not find MMFF94 or UFF force field in OpenBabel.")
+                
+            ff.Setup(ob_mol)
+            ff.SteepestDescent(1000, 1.0e-4)
+            ff.WeightedRotorSearch(50, 20)
+            ff.ConjugateGradients(3000, 1.0e-6)
+            ff.GetCoordinates(ob_mol)
 
-                # Convert optimized OBMol back to XYZ string for ASE
-                ob_conversion.SetOutFormat("xyz")
-                optimized_xyz_str = ob_conversion.WriteString(ob_mol)
+            # Convert optimized OBMol back to XYZ string for ASE
+            ob_conversion.SetOutFormat("xyz")
+            optimized_xyz_str = ob_conversion.WriteString(ob_mol)
 
-                # Read into ASE Atoms object for TBLite optimization
-                optimized_ats = list(read_xyz(StringIO(optimized_xyz_str), 0))[0]
-                optimized_ats.calc = TBLite()
-                dyn = LBFGS(optimized_ats)
-                dyn.run(fmax=0.05)
+            # Read into ASE Atoms object
+            optimized_ats = list(read_xyz(StringIO(optimized_xyz_str), 0))[0]
+            final_ats = optimized_ats
 
-                final_ats = optimized_ats
-                final_ats.calc = None # Remove calculator before returning to main process
+        except Exception as e:
+            logging.warning(
+                f"OpenBabel optimization failed for molecule {idx}. Error: {e}. Skipping molecule."
+            )
+            return idx, None, None, "opt_failed"
 
-            except Exception as e:
-                logging.warning(
-                    f"TBLite optimization failed for molecule {idx}. "
-                    f"Error: {e}. Using original geometry."
-                )
+    if np.isnan(final_ats.positions).any():
+        logging.warning(f"Molecule {idx} contains NaN positions/distances. Skipping molecule.")
+        return idx, None, None, "nan"
 
-    return idx, final_ats, properties
+    if distance_threshold > 0:
+        dm = final_ats.get_all_distances()
+        np.fill_diagonal(dm, np.inf)
+        if np.any(dm < distance_threshold):
+            logging.warning(f"Molecule {idx} contains atoms too close (<{distance_threshold}A). Skipping molecule.")
+            return idx, None, None, "distance"
+
+    return idx, final_ats, properties, None
+
 
 
 
@@ -137,8 +265,9 @@ class QM9(AtomsDataModule):
     """
 
     base_urls = [
-        "https://ndownloader.figshare.com/files/",
+        "https://figshare.com/ndownloader/files/",
         "https://springernature.figshare.com/ndownloader/files/",
+        "https://ndownloader.figshare.com/files/",
     ]
     file_ids = {
         "data": "3195389",
@@ -187,6 +316,9 @@ class QM9(AtomsDataModule):
         distance_unit: Optional[str] = None,
         data_workdir: Optional[str] = None,
         optimize_geometries: bool = False,
+        use_smiles: bool = False,
+        distance_threshold: float = 0.15,
+        store_both_geometries: bool = False,
         **kwargs,
     ):
         """
@@ -213,6 +345,8 @@ class QM9(AtomsDataModule):
             property_units: Dictionary from property to corresponding unit as a string (eV, kcal/mol, ...).
             distance_unit: Unit of the atom positions and cell as a string (Ang, Bohr, ...).
             data_workdir: Copy data here as part of setup, e.g. cluster scratch for faster performance.
+            distance_threshold: Threshold for filtering molecules with atoms too close.
+            store_both_geometries: If True, store both SMILES-generated and original geometries.
         """
         super().__init__(
             datapath=datapath,
@@ -240,15 +374,55 @@ class QM9(AtomsDataModule):
 
         self.remove_uncharacterized = remove_uncharacterized
         self.optimize_geometries = optimize_geometries
+        self.use_smiles = use_smiles
+        self.distance_threshold = distance_threshold
+        self.store_both_geometries = store_both_geometries
 
     def _download_file(self, file_id: str, destination: str):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://figshare.com/",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        session = requests.Session()
+        session.headers.update(headers)
+
         for base_url in self.base_urls:
+            # S3 bucket uses filenames, figshare uses IDs
             url = f"{base_url}{file_id}"
+
+            logging.info(f"Attempting to download from {url}...")
             try:
-                request.urlretrieve(url, destination)
-                return
-            except Exception:
-                logging.warning(f"Could not download from {url}, trying next source...")
+                response = session.get(url, stream=True, timeout=10)
+                if response.status_code == 202:
+                    logging.warning(
+                        f"Got 202 from {url}, waiting 2 seconds and retrying..."
+                    )
+                    time.sleep(2)
+                    response = session.get(url, stream=True, timeout=10)
+
+                if response.status_code == 200:
+                    logging.info(
+                        f"Connected to {url}. Final URL: {response.url}. Status: {response.status_code}"
+                    )
+                    with open(destination, "wb") as out_file:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            out_file.write(chunk)
+                    logging.info(f"Successfully downloaded {file_id} to {destination}")
+                    return
+                else:
+                    logging.warning(
+                        f"Download from {url} failed with status {response.status_code}"
+                    )
+            except Exception as e:
+                logging.warning(
+                    f"Could not download from {url}, trying next source... Error: {e}"
+                )
+            time.sleep(1)
         raise AtomsDataModuleError(
             f"Could not download file with id {file_id} from any source."
         )
@@ -321,6 +495,8 @@ class QM9(AtomsDataModule):
             QM9.G: "Ha",
             QM9.Cv: "cal/mol/K",
         }
+        if self.store_both_geometries:
+            property_unit_dict["R_real"] = "Ang"
 
         tmpdir = tempfile.mkdtemp("qm9")
         atomrefs = self._download_atomrefs(tmpdir)
@@ -448,12 +624,6 @@ class QM9(AtomsDataModule):
             with open(xyzfile, "r") as f:
                 file_contents_for_tasks.append((i, f.readlines())) # Store (original_idx, lines)
 
-        if self.optimize_geometries and not TBLITE_AVAILABLE:
-            logging.error(
-                "TBLite optimization requested, but TBLite is not available. "
-                "Optimization will be skipped for all molecules."
-            )
-        
         # Create tasks for the worker pool
         tasks = []
         for original_idx, lines in file_contents_for_tasks:
@@ -463,30 +633,55 @@ class QM9(AtomsDataModule):
                     lines, 
                     dataset.available_properties, 
                     self.optimize_geometries, 
-                    TBLITE_AVAILABLE, 
-                    TBLITE_IMPORT_ERROR if not TBLITE_AVAILABLE else None
+                    self.use_smiles,
+                    self.distance_threshold,
+                    self.store_both_geometries,
                 )
             )
 
         collected_properties = [] # Collect all properties here
+        skip_stats = {
+            "nan": 0,
+            "distance": 0,
+            "smiles_failed": 0,
+            "alignment_failed": 0,
+            "opt_failed": 0,
+            "worker_error": 0,
+        }
 
-        for task in tqdm(tasks, desc="Processing molecules (TBLite optimization)"):
-            original_idx, final_ats, props = _optimize_molecule_worker(task)
+        for task in tqdm(tasks, desc="Processing molecules"):
+            original_idx, final_ats, props, skip_reason = _optimize_molecule_worker(task)
 
-            if final_ats is None:  # Worker signaled an error (or TBLite not available)
-                logging.error(
-                    f"Worker failed to process molecule {original_idx}. Skipping this molecule."
-                )
+            if final_ats is None:  # Worker signaled an error (or skip)
+                if skip_reason:
+                    skip_stats[skip_reason] += 1
+                else:
+                    skip_stats["worker_error"] += 1
+                    logging.error(
+                        f"Worker failed to process molecule {original_idx}. Skipping this molecule."
+                    )
                 continue
 
             properties = props
             properties[structure.Z] = final_ats.numbers
             properties[structure.R] = final_ats.positions
-            properties[structure.cell] = final_ats.cell
+            
+            # If both are stored, props already contains R_real from the worker
+            # and it is aligned with final_ats.numbers
+
+            # Explicitly cast the ASE Cell object to a numpy array to prevent LMDB serialization corruption
+            properties[structure.cell] = np.array(final_ats.cell.array) if hasattr(final_ats.cell, 'array') else np.array(final_ats.cell)
             properties[structure.pbc] = final_ats.pbc
             collected_properties.append(properties)
 
         property_list = collected_properties
+
+        if sum(skip_stats.values()) > 0:
+            logging.info("QM9 Data Filtering Report:")
+            for reason, count in skip_stats.items():
+                if count > 0:
+                    logging.info(f"  - {reason}: {count} molecules filtered")
+            logging.info(f"Total molecules filtered: {sum(skip_stats.values())}")
 
         logging.info("Write atoms to db...")
         dataset.add_systems(property_list=property_list)

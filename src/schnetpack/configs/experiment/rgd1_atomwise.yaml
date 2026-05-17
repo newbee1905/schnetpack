@@ -3,25 +3,29 @@
 defaults:
   - override /model: nnp
   - override /model/representation: painn
-  - override /data: qm9
+  - override /data: rgd1
 
 run:
-  experiment: qm9_painn_${globals.property} # changed experiment name
+  experiment: rgd1_atomwise_${globals.state}
 
 globals:
-  cutoff: 5.
-  lr: 5e-4
-  property: free_energy
+  cutoff: 6.
+  lr: 1e-4
+  property: energy
   aggregation: sum
+  state: [reactants, ts, products]
 
 data:
-  datapath: ${run.data_dir}/qm9_painn.lmdb
+  states: ${globals.state}
   transforms:
     - _target_: schnetpack.transform.SubtractCenterOfMass
     - _target_: schnetpack.transform.RemoveOffsets
       property: ${globals.property}
       remove_atomrefs: True
-      remove_mean: True
+      remove_mean: False
+    - _target_: schnetpack.transform.RemoveGroupOffsets
+      property: ${globals.property}
+      is_extensive: True
     - _target_: schnetpack.transform.MatScipyNeighborList
       cutoff: ${globals.cutoff}
     - _target_: schnetpack.transform.CastTo32
@@ -34,15 +38,19 @@ model:
       aggregation_mode: ${globals.aggregation}
   postprocessors:
     - _target_: schnetpack.transform.CastTo64
+    - _target_: schnetpack.transform.AddGroupOffsets
+      property: ${globals.property}
+      is_extensive: True
     - _target_: schnetpack.transform.AddOffsets
       property: ${globals.property}
-      add_mean: True
+      add_mean: False
       add_atomrefs: True
 
 task:
   outputs:
-    - _target_: schnetpack.task.ModelOutput
+    - _target_: schnetpack.task.GroupedEnergyOutput
       name: ${globals.property}
+      target_property: ${globals.property}
       loss_fn:
         _target_: torch.nn.MSELoss
       metrics:
@@ -51,4 +59,8 @@ task:
         rmse:
           _target_: torchmetrics.regression.MeanSquaredError
           squared: False
+        # delta_e_mae:
+        #   _target_: schnetpack.train.metrics.DeltaEMAE
+        # delta_e_rmse:
+        #   _target_: schnetpack.train.metrics.DeltaERMSE
       loss_weight: 1.

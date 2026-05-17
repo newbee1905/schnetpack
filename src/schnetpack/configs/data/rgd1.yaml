@@ -1,0 +1,14 @@
+defaults:
+  - custom
+
+_target_: schnetpack.datasets.rgd1.RGD1Single
+
+datapath: ${run.data_dir}/rgd1.lmdb
+batch_size: 128
+num_train: 100000
+num_val: 10000
+num_workers: 8
+states: [reactants, ts, products]
+distance_unit: Ang
+property_units:
+  energy: eV

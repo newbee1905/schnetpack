@@ -126,7 +126,10 @@ class AtomisticModel(nn.Module):
     def extract_outputs(
         self, inputs: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        results = {k: inputs[k] for k in self.model_outputs}
+        results: Dict[str, torch.Tensor] = {}
+        for k in self.model_outputs:
+            if k in inputs:
+                results[k] = inputs[k]
         return results
 
 

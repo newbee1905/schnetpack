@@ -14,27 +14,46 @@ __all__ = ["PaiNN", "PaiNNInteraction", "PaiNNMixing"]
 class PaiNNInteraction(nn.Module):
     r"""PaiNN interaction block for modeling equivariant interactions of atomistic systems."""
 
-    def __init__(self, n_atom_basis: int, activation: Callable, epsilon: float = 1e-8, use_norm: bool = False, use_glu_variant: bool = False):
+    def __init__(
+        self,
+        n_atom_basis: int,
+        activation: Callable,
+        epsilon: float = 1e-8,
+        use_norm: bool = False,
+        use_glu_variant: bool = False,
+        kan_degree: Optional[int] = None,
+    ):
         """
         Args:
             n_atom_basis: number of features to describe atomic environments.
             activation: if None, no activation function is used.
+            kan_degree: degree of the shifted Chebyshev polynomials for KAN layers.
         """
         super(PaiNNInteraction, self).__init__()
         self.n_atom_basis = n_atom_basis
         self.use_norm = use_norm
 
         if self.use_norm:
-            self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
-            self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+            self.norm_q = nn.LayerNorm(n_atom_basis, eps=epsilon)
+            self.norm_mu = snn.EquivariantLayerNorm(n_atom_basis, eps=epsilon)
         else:
             self.norm_q = nn.Identity()
             self.norm_mu = nn.Identity()
 
-        self.interatomic_context_net = nn.Sequential(
-            snn.Dense(n_atom_basis, n_atom_basis, activation=activation, use_glu_variant=use_glu_variant),
-            snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
-        )
+        if kan_degree is not None:
+            self.interatomic_context_net = snn.ShiftedChebyKANLayer(
+                n_atom_basis, 3 * n_atom_basis, kan_degree
+            )
+        else:
+            self.interatomic_context_net = nn.Sequential(
+                snn.Dense(
+                    n_atom_basis,
+                    n_atom_basis,
+                    activation=activation,
+                    use_glu_variant=use_glu_variant,
+                ),
+                snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
+            )
 
     def forward(
         self,
@@ -86,12 +105,21 @@ class PaiNNInteraction(nn.Module):
 class PaiNNMixing(nn.Module):
     r"""PaiNN interaction block for mixing on atom features."""
 
-    def __init__(self, n_atom_basis: int, activation: Callable, epsilon: float = 1e-8, use_norm: bool = False, use_glu_variant: bool = False):
+    def __init__(
+        self,
+        n_atom_basis: int,
+        activation: Callable,
+        epsilon: float = 1e-8,
+        use_norm: bool = False,
+        use_glu_variant: bool = False,
+        kan_degree: Optional[int] = None,
+    ):
         """
         Args:
             n_atom_basis: number of features to describe atomic environments.
             activation: if None, no activation function is used.
             epsilon: stability constant added in norm to prevent numerical instabilities
+            kan_degree: degree of the shifted Chebyshev polynomials for KAN layers.
         """
         super(PaiNNMixing, self).__init__()
         self.n_atom_basis = n_atom_basis
@@ -99,16 +127,26 @@ class PaiNNMixing(nn.Module):
         self.use_glu_variant = use_glu_variant
 
         if self.use_norm:
-            self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
-            self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+            self.norm_q = nn.LayerNorm(n_atom_basis, eps=epsilon)
+            self.norm_mu = snn.EquivariantLayerNorm(n_atom_basis, eps=epsilon)
         else:
             self.norm_q = nn.Identity()
             self.norm_mu = nn.Identity()
 
-        self.intraatomic_context_net = nn.Sequential(
-            snn.Dense(2 * n_atom_basis, n_atom_basis, activation=activation, use_glu_variant=use_glu_variant),
-            snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
-        )
+        if kan_degree is not None:
+            self.intraatomic_context_net = snn.ShiftedChebyKANLayer(
+                2 * n_atom_basis, 3 * n_atom_basis, kan_degree
+            )
+        else:
+            self.intraatomic_context_net = nn.Sequential(
+                snn.Dense(
+                    2 * n_atom_basis,
+                    n_atom_basis,
+                    activation=activation,
+                    use_glu_variant=use_glu_variant,
+                ),
+                snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
+            )
         self.mu_channel_mix = snn.Dense(
             n_atom_basis, 2 * n_atom_basis, activation=None, bias=False
         )
@@ -175,6 +213,7 @@ class PaiNN(nn.Module):
         electronic_embeddings: Optional[List] = None,
         use_norm: bool = False,
         use_glu_variant: bool = False,
+        kan_degree: Optional[int] = None,
     ):
         """
         Args:
@@ -192,6 +231,7 @@ class PaiNN(nn.Module):
             nuclear_embedding: custom nuclear embedding (e.g. spk.nn.embeddings.NuclearEmbedding)
             electronic_embeddings: list of electronic embeddings. E.g. for spin and
                 charge (see spk.nn.embeddings.ElectronicEmbedding)
+            kan_degree: degree of the shifted Chebyshev polynomials for KAN layers.
         """
         super(PaiNN, self).__init__()
 
@@ -227,16 +267,24 @@ class PaiNN(nn.Module):
         # initialize interaction blocks
         self.interactions = snn.replicate_module(
             lambda: PaiNNInteraction(
-                n_atom_basis=self.n_atom_basis, activation=activation, epsilon=epsilon,
-                use_glu_variant=use_glu_variant, use_norm=use_norm,
+                n_atom_basis=self.n_atom_basis,
+                activation=activation,
+                epsilon=epsilon,
+                use_glu_variant=use_glu_variant,
+                use_norm=use_norm,
+                kan_degree=kan_degree,
             ),
             self.n_interactions,
             shared_interactions,
         )
         self.mixing = snn.replicate_module(
             lambda: PaiNNMixing(
-                n_atom_basis=self.n_atom_basis, activation=activation, epsilon=epsilon,
-                use_glu_variant=use_glu_variant, use_norm=use_norm,
+                n_atom_basis=self.n_atom_basis,
+                activation=activation,
+                epsilon=epsilon,
+                use_glu_variant=use_glu_variant,
+                use_norm=use_norm,
+                kan_degree=kan_degree,
             ),
             self.n_interactions,
             shared_interactions,

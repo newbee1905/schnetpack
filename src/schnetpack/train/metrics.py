@@ -7,7 +7,31 @@ from torchmetrics.functional.regression.mae import (
 
 from typing import Optional, Tuple
 
-__all__ = ["TensorDiagonalMeanAbsoluteError"]
+from torchmetrics.regression import MeanAbsoluteError, MeanSquaredError
+
+__all__ = ["TensorDiagonalMeanAbsoluteError", "DeltaEMAE", "DeltaERMSE"]
+
+
+class DeltaEMAE(MeanAbsoluteError):
+    """
+    Mean Absolute Error for Delta E (reaction barriers).
+    Tagged with is_delta_e=True for GroupedEnergyOutput.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.is_delta_e = True
+
+
+class DeltaERMSE(MeanSquaredError):
+    """
+    Root Mean Squared Error for Delta E (reaction barriers).
+    Tagged with is_delta_e=True for GroupedEnergyOutput.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(squared=False, **kwargs)
+        self.is_delta_e = True
 
 
 class TensorDiagonalMeanAbsoluteError(Metric):
