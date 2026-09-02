@@ -3,7 +3,7 @@ import os
 import uuid
 import tempfile
 import socket
-from typing import List
+from typing import List, Any, Optional, Callable
 import random
 import petname
 
@@ -38,6 +38,19 @@ header = """
 /____/\___/_/ /_/_/ |_/\___/\__/_/    \__,_/\___/_/|_|
 """
 
+from lightning_fabric.plugins.io import TorchCheckpointIO
+from lightning_fabric.utilities.types import _PATH
+
+class CustomTorchCheckpointIO(TorchCheckpointIO):
+    def load_checkpoint(
+        self,
+        path: _PATH,
+        map_location: Optional[Callable] = lambda storage, loc: storage,
+        weights_only: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        # Force weights_only=False to allow loading custom classes
+        return super().load_checkpoint(path, map_location=map_location, weights_only=False)
+
 
 @hydra.main(config_path="configs", config_name="train", version_base="1.2")
 def train(config: DictConfig):
@@ -45,6 +58,9 @@ def train(config: DictConfig):
     General training routine for all models defined by the provided hydra configs.
 
     """
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     print(header)
     log.info("Running on host: " + str(socket.gethostname()))
 
@@ -114,6 +130,7 @@ def train(config: DictConfig):
 
     # Init Lightning datamodule
     log.info(f"Instantiating datamodule <{config.data._target_}>")
+
     datamodule: LightningDataModule = hydra.utils.instantiate(
         config.data,
         train_sampler_cls=(
@@ -122,6 +139,19 @@ def train(config: DictConfig):
             else None
         ),
     )
+
+    datamodule.prepare_data()
+    datamodule.setup()
+
+    # QM9 specific size (including uncharacterized) is 133885
+    full_qm9_size = 133885
+    current_size = len(datamodule.dataset)
+    train_size = len(datamodule.train_dataset)
+
+    log.info(
+        f"Training data: {train_size} / {current_size} (current dataset) / {full_qm9_size} (full QM9)"
+    )
+
 
     # Init model
     log.info(f"Instantiating model <{config.model._target_}>")
@@ -166,6 +196,7 @@ def train(config: DictConfig):
         callbacks=callbacks,
         logger=logger,
         default_root_dir=os.path.join(config.run.id),
+        plugins=[CustomTorchCheckpointIO()],
         _convert_="partial",
     )
 
@@ -174,7 +205,11 @@ def train(config: DictConfig):
 
     # Train the model
     log.info("Starting training.")
-    trainer.fit(model=task, datamodule=datamodule, ckpt_path=config.run.ckpt_path)
+    trainer.fit(
+        model=task,
+        datamodule=datamodule,
+        ckpt_path=config.run.ckpt_path,
+    )
 
     # Evaluate model on test set after training
     log.info("Starting testing.")
@@ -185,7 +220,7 @@ def train(config: DictConfig):
     log.info(f"Best checkpoint path:\n{best_path}")
 
     log.info(f"Store best model")
-    best_task = type(task).load_from_checkpoint(best_path)
+    best_task = type(task).load_from_checkpoint(best_path, weights_only=False)
     torch.save(best_task, config.globals.model_path + ".task")
 
     best_task.save_model(config.globals.model_path, do_postprocessing=True)

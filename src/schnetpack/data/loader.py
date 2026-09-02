@@ -4,9 +4,8 @@ from torch.utils.data import DataLoader
 from typing import Optional, Sequence
 from torch.utils.data import Dataset, Sampler
 try:
-    # torch >= 2.4 exposes the public alias
     from torch.utils.data.dataloader import _collate_fn_t, T_co
-except ImportError:  # pragma: no cover - older torch
+except ImportError:
     from torch.utils.data.dataloader import _collate_fn_t, _T_co as T_co
 
 import schnetpack.properties as structure

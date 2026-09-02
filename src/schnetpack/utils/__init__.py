@@ -5,37 +5,57 @@ from typing import Type, Union, List
 
 from schnetpack import properties as spk_properties
 
-TORCH_DTYPES = {
-    "float32": torch.float32,
-    "float64": torch.float64,
-    "float": torch.float,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "half": torch.half,
-    "uint8": torch.uint8,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "short": torch.short,
-    "int32": torch.int32,
-    "int": torch.int,
-    "int64": torch.int64,
-    "long": torch.long,
-    "complex64": torch.complex64,
-    "cfloat": torch.cfloat,
-    "complex128": torch.complex128,
-    "cdouble": torch.cdouble,
-    "quint8": torch.quint8,
-    "qint8": torch.qint8,
-    "qint32": torch.qint32,
-    "bool": torch.bool,
-}
-
-TORCH_DTYPES.update({"torch." + k: v for k, v in TORCH_DTYPES.items()})
-
-
 def as_dtype(dtype_str: str) -> torch.dtype:
     """Convert a string to torch.dtype"""
-    return TORCH_DTYPES[dtype_str]
+    if dtype_str.startswith("torch."):
+        dtype_str = dtype_str[6:]
+
+    if dtype_str == "float32":
+        return torch.float32
+    elif dtype_str == "float64":
+        return torch.float64
+    elif dtype_str == "float":
+        return torch.float
+    elif dtype_str == "float16":
+        return torch.float16
+    elif dtype_str == "bfloat16":
+        return torch.bfloat16
+    elif dtype_str == "half":
+        return torch.half
+    elif dtype_str == "uint8":
+        return torch.uint8
+    elif dtype_str == "int8":
+        return torch.int8
+    elif dtype_str == "int16":
+        return torch.int16
+    elif dtype_str == "short":
+        return torch.short
+    elif dtype_str == "int32":
+        return torch.int32
+    elif dtype_str == "int":
+        return torch.int
+    elif dtype_str == "int64":
+        return torch.int64
+    elif dtype_str == "long":
+        return torch.long
+    elif dtype_str == "complex64":
+        return torch.complex64
+    elif dtype_str == "cfloat":
+        return torch.cfloat
+    elif dtype_str == "complex128":
+        return torch.complex128
+    elif dtype_str == "cdouble":
+        return torch.cdouble
+    elif dtype_str == "quint8":
+        return torch.quint8
+    elif dtype_str == "qint8":
+        return torch.qint8
+    elif dtype_str == "qint32":
+        return torch.qint32
+    elif dtype_str == "bool":
+        return torch.bool
+    else:
+        raise AttributeError(f"Unsupported dtype string: {dtype_str}")
 
 
 def int2precision(precision: Union[int, torch.dtype]):

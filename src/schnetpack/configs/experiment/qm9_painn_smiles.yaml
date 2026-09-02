@@ -2,10 +2,11 @@
 
 defaults:
   - override /model: nnp
-  - override /data: qm9
+  - override /model/representation: painn
+  - override /data: qm9_smiles
 
 run:
-  experiment: qm9_${globals.property}
+  experiment: qm9_painn_smiles
 
 globals:
   cutoff: 5.
@@ -23,6 +24,9 @@ data:
     - _target_: schnetpack.transform.MatScipyNeighborList
       cutoff: ${globals.cutoff}
     - _target_: schnetpack.transform.CastTo32
+
+trainer:
+  accumulate_grad_batches: 4
 
 model:
   output_modules:
@@ -46,7 +50,4 @@ task:
       metrics:
         mae:
           _target_: torchmetrics.regression.MeanAbsoluteError
-        rmse:
-          _target_: torchmetrics.regression.MeanSquaredError
-          squared: False
       loss_weight: 1.

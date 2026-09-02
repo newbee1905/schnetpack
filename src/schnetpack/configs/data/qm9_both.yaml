@@ -1,0 +1,6 @@
+defaults:
+  - qm9
+
+datapath: ${run.data_dir}/qm9_both.lmdb
+use_smiles: True
+store_both_geometries: True

@@ -7,7 +7,6 @@ import tarfile
 import tempfile
 import time
 from typing import List, Optional, Dict
-
 import requests
 
 import numpy as np
@@ -17,10 +16,240 @@ from tqdm import tqdm
 
 import torch
 from schnetpack.data import *
+from schnetpack.data import LMDBAtomsData 
 import schnetpack.properties as structure
 from schnetpack.data import AtomsDataModuleError, AtomsDataModule
 
+from rdkit import Chem
+from openbabel import openbabel
+from io import StringIO
+
+from ase import Atoms
+from ase.optimize import LBFGS
+from ase.io import write as ase_write_io
+from ase.io.extxyz import read_xyz
+
 __all__ = ["QM9"]
+
+def _optimize_molecule_worker(task_data):
+    """
+    Worker function to perform TBLite optimization for a single molecule.
+    """
+    from openbabel import openbabel
+    from io import StringIO
+    from ase.io import write as ase_write_io
+    from ase.io.extxyz import read_xyz
+    from ase import Atoms
+    import schnetpack.properties as structure
+
+    import numpy as np
+    
+    (
+        idx,
+        xyzfile_lines,
+        available_properties,
+        optimize_geometries_flag,
+        use_smiles_flag,
+        distance_threshold,
+        store_both_flag,
+    ) = task_data
+
+    properties = {}
+    # Parse properties from the second line of the XYZ file
+    l = xyzfile_lines[1].split()[2:]
+    for pn, p in zip(available_properties, l):
+        properties[pn] = np.array([float(p)])
+
+    tmp_str = "".join(xyzfile_lines).replace("*^", "e")
+    tmp = StringIO(tmp_str)
+    tmp.seek(0)
+
+    original_ats: Atoms = list(read_xyz(tmp, 0))[0]
+    final_ats = original_ats.copy()
+    num_atoms = len(original_ats)
+
+    if use_smiles_flag:
+        try:
+            smiles = ""
+            # Extract SMILES directly from standard QM9 file footer
+            if len(xyzfile_lines) > num_atoms + 3:
+                smiles_line = xyzfile_lines[num_atoms + 3].strip()
+                if smiles_line and not smiles_line.replace(".", "").replace("-", "").isdigit():
+                    smiles = smiles_line.split()[0]
+
+            # Setup OpenBabel for SMILES conversion and mapping
+            tmp_xyz_io = StringIO()
+            ase_write_io(tmp_xyz_io, original_ats, format="xyz")
+            xyz_str = tmp_xyz_io.getvalue()
+
+            ob_conversion = openbabel.OBConversion()
+            ob_conversion.SetInFormat("xyz")
+            ob_mol = openbabel.OBMol()
+            ob_conversion.ReadString(ob_mol, xyz_str)
+
+            if not smiles:
+                tmp_xyz_io = StringIO()
+                ase_write_io(tmp_xyz_io, original_ats, format="xyz")
+                xyz_str = tmp_xyz_io.getvalue()
+
+                ob_conversion = openbabel.OBConversion()
+                ob_conversion.SetInFormat("xyz")
+                ob_mol = openbabel.OBMol()
+                ob_conversion.ReadString(ob_mol, xyz_str)
+
+                ob_conversion.SetOutFormat("can")
+                smiles = ob_conversion.WriteString(ob_mol).strip()
+
+            # Generate 3D structure from SMILES using Open Babel
+            ob_mol_smi = openbabel.OBMol()
+            ob_conversion.SetInFormat("smi")
+            ob_conversion.ReadString(ob_mol_smi, smiles)
+
+            ob_mol_smi.AddHydrogens()
+
+            builder = openbabel.OBBuilder()
+            builder.Build(ob_mol_smi)
+            
+            ff = openbabel.OBForceField.FindForceField("mmff94")
+            if ff is None:
+                raise ValueError("Could not find MMFF94 force field. Check Open Babel installation.")
+
+            ff.Setup(ob_mol_smi)
+            ff.SteepestDescent(500)
+            ff.GetCoordinates(ob_mol_smi)
+
+            # Convert Open Babel mol to RDKit mol to ensure consistent indexing
+            # for the isomorphism check while keeping OB coordinates.
+            ob_conversion.SetOutFormat("mol")
+            mol_block = ob_conversion.WriteString(ob_mol_smi)
+            mol_smi = Chem.MolFromMolBlock(mol_block, removeHs=False)
+            
+            if mol_smi is None:
+                raise ValueError(f"RDKit failed to import Open Babel mol block for SMILES: {smiles}")
+
+            # Extract final atoms from the RDKit-wrapped OB geometry
+            conf = mol_smi.GetConformer()
+            new_pos = conf.GetPositions()
+            new_z = [a.GetAtomicNum() for a in mol_smi.GetAtoms()]
+            final_ats = Atoms(numbers=new_z, positions=new_pos)
+
+            # Map original positions to new atom order if requested
+            if store_both_flag:
+                from rdkit.Chem import rdDetermineBonds
+
+                try:
+                    # Load the original XYZ into RDKit and perceive bonds
+                    tmp_io = StringIO()
+                    ase_write_io(tmp_io, original_ats, format="xyz")
+                    clean_xyz_block = tmp_io.getvalue()
+                    
+                    raw_mol_xyz = Chem.MolFromXYZBlock(clean_xyz_block)
+                    if raw_mol_xyz is None:
+                        raise ValueError("RDKit failed to parse the clean XYZ block.")
+
+                    rdDetermineBonds.DetermineConnectivity(raw_mol_xyz)
+                    rdDetermineBonds.DetermineBondOrders(raw_mol_xyz, charge=0)
+
+                    # Find mapping: SMILES indices (OB-ordered) -> XYZ indices
+                    matches = raw_mol_xyz.GetSubstructMatches(mol_smi, uniquify=False)
+
+                    if matches:
+                        orig_pos = original_ats.positions
+                        best_match = None
+                        min_rmsd = float('inf')
+                        
+                        # Center the SMILES conformer for alignment
+                        new_pos_centered = new_pos - np.mean(new_pos, axis=0)
+                        
+                        for match in matches:
+                            reordered_orig = orig_pos[list(match)]
+                            reordered_orig_centered = reordered_orig - np.mean(reordered_orig, axis=0)
+                            
+                            # Optimal rotation (Kabsch algorithm)
+                            cov = reordered_orig_centered.T @ new_pos_centered
+                            u, s, vh = np.linalg.svd(cov)
+                            d = np.linalg.det(u @ vh)
+                            if d < 0:
+                                u[:, -1] *= -1
+                            rot = u @ vh
+                            
+                            # Rotate original coordinates to match SMILES orientation
+                            aligned_orig = reordered_orig_centered @ rot
+                            
+                            rmsd = np.sqrt(np.mean((aligned_orig - new_pos_centered)**2))
+                            if rmsd < min_rmsd:
+                                min_rmsd = rmsd
+                                best_match = reordered_orig
+                                
+                        properties["R_real"] = best_match.astype(np.float32)
+                    else:
+                        raise ValueError(f"No graph isomorphism found between SMILES and original XYZ.")
+
+                except Exception as e:
+                    logging.warning(f"RDKit Alignment failed for molecule {idx}: {e}. Skipping molecule.")
+                    return idx, None, None, "alignment_failed"
+
+        except Exception as e:
+            logging.warning(
+                f"SMILES conversion failed for molecule {idx}. Error: {e}. Skipping molecule."
+            )
+            return idx, None, None, "smiles_failed"
+
+    if optimize_geometries_flag:
+        try:
+            # Convert current ASE Atoms (either original or SMILES-generated) to XYZ string
+            tmp_xyz_io = StringIO()
+            ase_write_io(tmp_xyz_io, final_ats, format="xyz")
+            xyz_str = tmp_xyz_io.getvalue()
+
+            # Convert XYZ string to OpenBabel OBMol
+            ob_conversion = openbabel.OBConversion()
+            ob_conversion.SetInFormat("xyz")
+            ob_mol = openbabel.OBMol()
+            ob_conversion.ReadString(ob_mol, xyz_str)
+
+            # Use MMFF94 force field for optimization via OpenBabel
+            ff = openbabel.OBForceField.FindForceField("mmff94")
+            if ff is None:
+                ff = openbabel.OBForceField.FindForceField("uff")
+                
+            if ff is None:
+                raise RuntimeError("Could not find MMFF94 or UFF force field in OpenBabel.")
+                
+            ff.Setup(ob_mol)
+            ff.SteepestDescent(1000, 1.0e-4)
+            ff.WeightedRotorSearch(50, 20)
+            ff.ConjugateGradients(3000, 1.0e-6)
+            ff.GetCoordinates(ob_mol)
+
+            # Convert optimized OBMol back to XYZ string for ASE
+            ob_conversion.SetOutFormat("xyz")
+            optimized_xyz_str = ob_conversion.WriteString(ob_mol)
+
+            # Read into ASE Atoms object
+            optimized_ats = list(read_xyz(StringIO(optimized_xyz_str), 0))[0]
+            final_ats = optimized_ats
+
+        except Exception as e:
+            logging.warning(
+                f"OpenBabel optimization failed for molecule {idx}. Error: {e}. Skipping molecule."
+            )
+            return idx, None, None, "opt_failed"
+
+    if np.isnan(final_ats.positions).any():
+        logging.warning(f"Molecule {idx} contains NaN positions/distances. Skipping molecule.")
+        return idx, None, None, "nan"
+
+    if distance_threshold > 0:
+        dm = final_ats.get_all_distances()
+        np.fill_diagonal(dm, np.inf)
+        if np.any(dm < distance_threshold):
+            logging.warning(f"Molecule {idx} contains atoms too close (<{distance_threshold}A). Skipping molecule.")
+            return idx, None, None, "distance"
+
+    return idx, final_ats, properties, None
+
+
 
 
 class QM9(AtomsDataModule):
@@ -33,7 +262,6 @@ class QM9(AtomsDataModule):
     References:
 
         .. [#qm9_1] https://ndownloader.figshare.com/files/3195404
-
     """
 
     base_urls = [
@@ -72,7 +300,7 @@ class QM9(AtomsDataModule):
         num_val: Optional[int] = None,
         num_test: Optional[int] = None,
         split_file: Optional[str] = "split.npz",
-        format: Optional[AtomsDataFormat] = None,
+        format: Optional[AtomsDataFormat] = AtomsDataFormat.LMDB,
         load_properties: Optional[List[str]] = None,
         remove_uncharacterized: bool = False,
         val_batch_size: Optional[int] = None,
@@ -87,6 +315,10 @@ class QM9(AtomsDataModule):
         property_units: Optional[Dict[str, str]] = None,
         distance_unit: Optional[str] = None,
         data_workdir: Optional[str] = None,
+        optimize_geometries: bool = False,
+        use_smiles: bool = False,
+        distance_threshold: float = 0.15,
+        store_both_geometries: bool = False,
         **kwargs,
     ):
         """
@@ -113,6 +345,8 @@ class QM9(AtomsDataModule):
             property_units: Dictionary from property to corresponding unit as a string (eV, kcal/mol, ...).
             distance_unit: Unit of the atom positions and cell as a string (Ang, Bohr, ...).
             data_workdir: Copy data here as part of setup, e.g. cluster scratch for faster performance.
+            distance_threshold: Threshold for filtering molecules with atoms too close.
+            store_both_geometries: If True, store both SMILES-generated and original geometries.
         """
         super().__init__(
             datapath=datapath,
@@ -139,6 +373,10 @@ class QM9(AtomsDataModule):
         )
 
         self.remove_uncharacterized = remove_uncharacterized
+        self.optimize_geometries = optimize_geometries
+        self.use_smiles = use_smiles
+        self.distance_threshold = distance_threshold
+        self.store_both_geometries = store_both_geometries
 
     def _download_file(
         self,
@@ -232,55 +470,137 @@ class QM9(AtomsDataModule):
             + ", ".join(self.base_urls)
         )
 
-    def prepare_data(self):
-        if not os.path.exists(self.datapath):
-            property_unit_dict = {
-                QM9.A: "GHz",
-                QM9.B: "GHz",
-                QM9.C: "GHz",
-                QM9.mu: "Debye",
-                QM9.alpha: "a0 a0 a0",
-                QM9.homo: "Ha",
-                QM9.lumo: "Ha",
-                QM9.gap: "Ha",
-                QM9.r2: "a0 a0",
-                QM9.zpve: "Ha",
-                QM9.U0: "Ha",
-                QM9.U: "Ha",
-                QM9.H: "Ha",
-                QM9.G: "Ha",
-                QM9.Cv: "cal/mol/K",
-            }
+    # def prepare_data(self):
+    #     if not os.path.exists(self.datapath):
+    #         property_unit_dict = {
+    #             QM9.A: "GHz",
+    #             QM9.B: "GHz",
+    #             QM9.C: "GHz",
+    #             QM9.mu: "Debye",
+    #             QM9.alpha: "a0 a0 a0",
+    #             QM9.homo: "Ha",
+    #             QM9.lumo: "Ha",
+    #             QM9.gap: "Ha",
+    #             QM9.r2: "a0 a0",
+    #             QM9.zpve: "Ha",
+    #             QM9.U0: "Ha",
+    #             QM9.U: "Ha",
+    #             QM9.H: "Ha",
+    #             QM9.G: "Ha",
+    #             QM9.Cv: "cal/mol/K",
+    #         }
 
-            tmpdir = tempfile.mkdtemp("qm9")
-            atomrefs = self._download_atomrefs(tmpdir)
+    def _convert_ase_to_lmdb(self, ase_db_path: str, lmdb_path: str):
+        ase_dataset = load_dataset(ase_db_path, AtomsDataFormat.ASE)
+        property_unit_dict = ase_dataset.metadata["_property_unit_dict"]
+        distance_unit = ase_dataset.metadata["_distance_unit"]
+        atomrefs = ase_dataset.metadata["atomrefs"]
 
-            dataset = create_dataset(
-                datapath=self.datapath,
-                format=self.format,
-                distance_unit="Ang",
-                property_unit_dict=property_unit_dict,
-                atomrefs=atomrefs,
-            )
+        lmdb_dataset = create_dataset(
+            datapath=lmdb_path,
+            format=AtomsDataFormat.LMDB,
+            distance_unit=distance_unit,
+            property_unit_dict=property_unit_dict,
+            atomrefs=atomrefs,
+        )
 
-            if self.remove_uncharacterized:
-                uncharacterized = self._download_uncharacterized(tmpdir)
-            else:
-                uncharacterized = None
-            self._download_data(tmpdir, dataset, uncharacterized=uncharacterized)
-            shutil.rmtree(tmpdir)
+        all_properties = []
+        for i in tqdm(range(len(ase_dataset)), desc="Converting ASE to LMDB"):
+            data = ase_dataset[i]
+            properties = {k: v.numpy() for k, v in data.items() if k not in [structure.Z, structure.R, structure.cell, structure.pbc, structure.idx, structure.n_atoms]}
+            
+            # Extract structure properties and ensure they are numpy arrays
+            properties[structure.Z] = data[structure.Z].numpy()
+            properties[structure.R] = data[structure.R].numpy()
+            properties[structure.cell] = data[structure.cell].numpy().squeeze()
+            properties[structure.pbc] = data[structure.pbc].numpy()
+            all_properties.append(properties)
+
+        lmdb_dataset.add_systems(property_list=all_properties)
+        del ase_dataset # release the connection to the ase_db
+        
+
+    def _download_and_create_dataset(self, target_datapath: str, target_format: AtomsDataFormat):
+        property_unit_dict = {
+            QM9.A: "GHz",
+            QM9.B: "GHz",
+            QM9.C: "GHz",
+            QM9.mu: "Debye",
+            QM9.alpha: "a0 a0 a0",
+            QM9.homo: "Ha",
+            QM9.lumo: "Ha",
+            QM9.gap: "Ha",
+            QM9.r2: "a0 a0",
+            QM9.zpve: "Ha",
+            QM9.U0: "Ha",
+            QM9.U: "Ha",
+            QM9.H: "Ha",
+            QM9.G: "Ha",
+            QM9.Cv: "cal/mol/K",
+        }
+        if self.store_both_geometries:
+            property_unit_dict["R_real"] = "Ang"
+
+        tmpdir = tempfile.mkdtemp("qm9")
+        atomrefs = self._download_atomrefs(tmpdir)
+
+        dataset = create_dataset(
+            datapath=target_datapath,
+            format=target_format,
+            distance_unit="Ang",
+            property_unit_dict=property_unit_dict,
+            atomrefs=atomrefs,
+        )
+
+        if self.remove_uncharacterized:
+            uncharacterized = self._download_uncharacterized(tmpdir)
         else:
-            dataset = load_dataset(self.datapath, self.format)
-            if self.remove_uncharacterized and len(dataset) == 133885:
-                raise AtomsDataModuleError(
-                    "The dataset at the chosen location contains the uncharacterized 3054 molecules. "
-                    + "Choose a different location to reload the data or set `remove_uncharacterized=False`!"
+            uncharacterized = None
+        self._download_data(tmpdir, dataset, uncharacterized=uncharacterized)
+        shutil.rmtree(tmpdir)
+        
+    def prepare_data(self):
+        # Resolve the data path and format
+        original_datapath = self.datapath
+        db_path, db_format = resolve_format(self.datapath, self.format)
+        self.datapath = db_path
+        self.format = db_format
+
+        if not os.path.exists(self.datapath):
+            if self.format == AtomsDataFormat.LMDB:
+                ase_db_path = os.path.splitext(self.datapath)[0] + ".db"
+                if os.path.exists(ase_db_path):
+                    logging.info(
+                        f"Converting ASE DB at {ase_db_path} to LMDB at {self.datapath}..."
+                    )
+                    self._convert_ase_to_lmdb(ase_db_path, self.datapath)
+                    logging.info("Conversion complete.")
+                else:
+                    logging.info(
+                        f"Neither LMDB nor ASE DB found at {self.datapath} or {ase_db_path}. Downloading and creating new dataset."
+                    )
+                    self._download_and_create_dataset(self.datapath, self.format)
+            elif self.format == AtomsDataFormat.ASE:
+                logging.info(
+                    f"ASE DB not found at {self.datapath}. Downloading and creating new dataset."
                 )
-            elif not self.remove_uncharacterized and len(dataset) < 133885:
-                raise AtomsDataModuleError(
-                    "The dataset at the chosen location does NOT contain the uncharacterized 3054 molecules. "
-                    + "Choose a different location to reload the data or set `remove_uncharacterized=True`!"
-                )
+                self._download_and_create_dataset(self.datapath, self.format)
+            else:
+                raise AtomsDataModuleError(f"Unsupported format: {self.format}")
+        
+        # After ensuring the database exists, perform checks for uncharacterized molecules
+        dataset = load_dataset(self.datapath, self.format)
+
+        if self.remove_uncharacterized and len(dataset) == 133885:
+            raise AtomsDataModuleError(
+                "The dataset at the chosen location contains the uncharacterized 3054 molecules. "
+                + "Choose a different location to reload the data or set `remove_uncharacterized=False`!"
+            )
+        elif not self.remove_uncharacterized and len(dataset) < 133885:
+            raise AtomsDataModuleError(
+                "The dataset at the chosen location does NOT contain the uncharacterized 3054 molecules. "
+                + "Choose a different location to reload the data or set `remove_uncharacterized=True`!"
+            )
 
     def _download_uncharacterized(self, tmpdir):
         logging.info("Downloading list of uncharacterized molecules...")
@@ -314,11 +634,13 @@ class QM9(AtomsDataModule):
     def _download_data(
         self, tmpdir, dataset: BaseAtomsData, uncharacterized: List[int]
     ):
+        logging.info("Starting _download_data()...")
         logging.info("Downloading GDB-9 data...")
         tar_path = os.path.join(tmpdir, "gdb9.tar.gz")
         raw_path = os.path.join(tmpdir, "gdb9_xyz")
+        logging.info("Calling _download_file for data...")
         self._download_file(self.file_ids["data"], tar_path)
-        logging.info("Done.")
+        logging.info("Done downloading GDB-9 data.")
 
         logging.info("Extracting files...")
         tar = tarfile.open(tar_path)
@@ -331,32 +653,78 @@ class QM9(AtomsDataModule):
             os.listdir(raw_path), key=lambda x: (int(re.sub(r"\D", "", x)), x)
         )
 
-        property_list = []
-
+        # Prepare tasks for the multiprocessing pool
+        tasks = []
         irange = np.arange(len(ordered_files), dtype=int)
         if uncharacterized is not None:
             irange = np.setdiff1d(irange, np.array(uncharacterized, dtype=int) - 1)
 
-        for i in tqdm(irange):
+        # Collect all file contents to avoid workers reading files (might cause contention)
+        # This is a trade-off: more memory usage, but potentially faster I/O if files are small
+        file_contents_for_tasks = []
+        for i in irange: # Use irange to iterate over valid indices
             xyzfile = os.path.join(raw_path, ordered_files[i])
-            properties = {}
-
-            tmp = io.StringIO()
             with open(xyzfile, "r") as f:
-                lines = f.readlines()
-                l = lines[1].split()[2:]
-                for pn, p in zip(dataset.available_properties, l):
-                    properties[pn] = np.array([float(p)])
-                for line in lines:
-                    tmp.write(line.replace("*^", "e"))
+                file_contents_for_tasks.append((i, f.readlines())) # Store (original_idx, lines)
 
-            tmp.seek(0)
-            ats: Atoms = list(read_xyz(tmp, 0))[0]
-            properties[structure.Z] = ats.numbers
-            properties[structure.R] = ats.positions
-            properties[structure.cell] = ats.cell
-            properties[structure.pbc] = ats.pbc
-            property_list.append(properties)
+        # Create tasks for the worker pool
+        tasks = []
+        for original_idx, lines in file_contents_for_tasks:
+            tasks.append(
+                (
+                    original_idx, 
+                    lines, 
+                    dataset.available_properties, 
+                    self.optimize_geometries, 
+                    self.use_smiles,
+                    self.distance_threshold,
+                    self.store_both_geometries,
+                )
+            )
+
+        collected_properties = [] # Collect all properties here
+        skip_stats = {
+            "nan": 0,
+            "distance": 0,
+            "smiles_failed": 0,
+            "alignment_failed": 0,
+            "opt_failed": 0,
+            "worker_error": 0,
+        }
+
+        for task in tqdm(tasks, desc="Processing molecules"):
+            original_idx, final_ats, props, skip_reason = _optimize_molecule_worker(task)
+
+            if final_ats is None:  # Worker signaled an error (or skip)
+                if skip_reason:
+                    skip_stats[skip_reason] += 1
+                else:
+                    skip_stats["worker_error"] += 1
+                    logging.error(
+                        f"Worker failed to process molecule {original_idx}. Skipping this molecule."
+                    )
+                continue
+
+            properties = props
+            properties[structure.Z] = final_ats.numbers
+            properties[structure.R] = final_ats.positions
+            
+            # If both are stored, props already contains R_real from the worker
+            # and it is aligned with final_ats.numbers
+
+            # Explicitly cast the ASE Cell object to a numpy array to prevent LMDB serialization corruption
+            properties[structure.cell] = np.array(final_ats.cell.array) if hasattr(final_ats.cell, 'array') else np.array(final_ats.cell)
+            properties[structure.pbc] = final_ats.pbc
+            collected_properties.append(properties)
+
+        property_list = collected_properties
+
+        if sum(skip_stats.values()) > 0:
+            logging.info("QM9 Data Filtering Report:")
+            for reason, count in skip_stats.items():
+                if count > 0:
+                    logging.info(f"  - {reason}: {count} molecules filtered")
+            logging.info(f"Total molecules filtered: {sum(skip_stats.values())}")
 
         logging.info("Write atoms to db...")
         dataset.add_systems(property_list=property_list)

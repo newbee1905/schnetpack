@@ -2,10 +2,11 @@
 
 defaults:
   - override /model: nnp
+  - override /model/representation: painn # Use the small painn model
   - override /data: qm9
 
 run:
-  experiment: qm9_${globals.property}
+  experiment: qm9_painn_${globals.property} # changed experiment name
 
 globals:
   cutoff: 5.
@@ -14,11 +15,13 @@ globals:
   aggregation: sum
 
 data:
+  datapath: ${run.data_dir}/qm9_painn.lmdb
+  optimize_geometries: False
   transforms:
     - _target_: schnetpack.transform.SubtractCenterOfMass
     - _target_: schnetpack.transform.RemoveOffsets
       property: ${globals.property}
-      remove_atomrefs: True
+      remove_atomrefs: False
       remove_mean: True
     - _target_: schnetpack.transform.MatScipyNeighborList
       cutoff: ${globals.cutoff}
@@ -35,7 +38,7 @@ model:
     - _target_: schnetpack.transform.AddOffsets
       property: ${globals.property}
       add_mean: True
-      add_atomrefs: True
+      add_atomrefs: False
 
 task:
   outputs:

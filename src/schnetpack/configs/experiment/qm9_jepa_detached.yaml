@@ -2,10 +2,11 @@
 
 defaults:
   - override /model: nnp
-  - override /data: qm9
+  - override /model/representation: painn
+  - override /data: qm9_both
 
 run:
-  experiment: qm9_${globals.property}
+  experiment: qm9_jepa_detached
 
 globals:
   cutoff: 5.
@@ -14,6 +15,10 @@ globals:
   aggregation: sum
 
 data:
+  batch_size: 16
+  num_train: 110000
+  num_val: 10000
+  num_test: null
   transforms:
     - _target_: schnetpack.transform.SubtractCenterOfMass
     - _target_: schnetpack.transform.RemoveOffsets
@@ -22,10 +27,30 @@ data:
       remove_mean: True
     - _target_: schnetpack.transform.MatScipyNeighborList
       cutoff: ${globals.cutoff}
+    - _target_: schnetpack.transform.MatScipyNeighborList
+      cutoff: ${globals.cutoff}
+      r_key: R_real
+      idx_i_key: _idx_i_real
+      idx_j_key: _idx_j_real
+      offsets_key: _offsets_real
     - _target_: schnetpack.transform.CastTo32
 
+trainer:
+  accumulate_grad_batches: 16
+
 model:
+  _target_: schnetpack.atomistic.jepa.JEPATask
+  predictor:
+    _target_: schnetpack.atomistic.jepa.PaiNNLatentPredictor
+    n_atom_basis: ${model.representation.n_atom_basis}
+    n_layers: 3
+    use_glu_variant: True
   output_modules:
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      predict_embeddings: True
+      lmbd: 10.0
     - _target_: schnetpack.atomistic.Atomwise
       output_key: ${globals.property}
       n_in: ${model.representation.n_atom_basis}
@@ -46,7 +71,10 @@ task:
       metrics:
         mae:
           _target_: torchmetrics.regression.MeanAbsoluteError
-        rmse:
-          _target_: torchmetrics.regression.MeanSquaredError
-          squared: False
       loss_weight: 1.
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      predict_embeddings: True
+      lmbd: 10.0
+      loss_weight: 0.1

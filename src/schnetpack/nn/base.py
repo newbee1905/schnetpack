@@ -8,7 +8,7 @@ from torch.nn.init import xavier_uniform_
 from torch.nn.init import zeros_
 
 
-__all__ = ["RMSNorm", "EquivariantRMSNorm", "Dense", "FeedForward"]
+__all__ = ["RMSNorm", "EquivariantRMSNorm", "Dense"]
 
 # RMSNorm from gemma
 # https://github.com/google/gemma_pytorch/blob/main/gemma/model.py
@@ -59,21 +59,21 @@ class EquivariantRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, mu):
-        # mu shape: [Batch, Atoms, 3, Features]
+        # mu shape: [..., 3, Features]
         mu_fp32 = mu.float()
 
-        # Compute Squared Norm of vectors first (Sum over spatial dim 2)
+        # Compute Squared Norm of vectors first (Sum over spatial dim -2)
         # This calculates (x^2 + y^2 + z^2) for every feature
-        # Shape: [Batch, Atoms, Features]
+        # Shape: [..., Features]
         vector_squared_norms = mu_fp32.pow(2).sum(dim=-2) 
 
         # Calculate Mean of the Squared Norms across features
-        # Shape: [Batch, Atoms, 1] (Broadcastable)
+        # Shape: [..., 1] (Broadcastable)
         variance = vector_squared_norms.mean(dim=-1, keepdim=True)
 
         # Create invariant scaler
         # We scale the vector by 1/RMS. This changes length, but not direction.
-        # [Batch, Atoms, 1] -> [Batch, Atoms, 1, 1]
+        # [..., 1] -> [..., 1, 1]
         inv_scale = torch.rsqrt(variance + self.eps).unsqueeze(-2)
 
         out = mu_fp32 * inv_scale
@@ -102,7 +102,7 @@ class Dense(nn.Linear):
         activation: Union[Callable, nn.Module] = None,
         weight_init: Callable = xavier_uniform_,
         bias_init: Callable = zeros_,
-        use_glu_variant: bool = True,
+        use_glu_variant: bool = False,
     ):
         """
         Args:
@@ -140,40 +140,4 @@ class Dense(nn.Linear):
             y = self.activation(y)
         return y
 
-class FeedForward(nn.Module):
-    """
-    Standard FeedForward Network (FFN) with optional GLU path.
-    """
-    def __init__(
-        self, 
-        n_atom_basis: int, 
-        expansion_ratio: int = 2, 
-        activation: Callable = F.silu,
-        use_glu_variant: bool = True
-    ):
-        super().__init__()
-        
-        hidden_dim = n_atom_basis * expansion_ratio
-
-        self.net_up = Dense(
-            in_features=n_atom_basis, 
-            out_features=hidden_dim, 
-            bias=True, 
-            activation=activation,
-            use_glu_variant=use_glu_variant
-        )
-
-        self.net_down = Dense(
-            in_features=hidden_dim, 
-            out_features=n_atom_basis, 
-            bias=True, 
-            activation=None, # Linear output
-            use_glu_variant=False
-        )
-
-    def forward(self, x):
-        x = self.net_up(x)
-        x = self.net_down(x)
-        return x
-
-# vi:ts=4 sw=4 et
+# vi: set ts=4 sw=4 expandtab:

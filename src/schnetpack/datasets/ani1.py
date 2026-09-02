@@ -3,7 +3,7 @@ import os
 import shutil
 import tempfile
 from typing import List, Optional, Dict
-from urllib import request as request
+import requests
 
 import numpy as np
 from ase import Atoms
@@ -141,8 +141,14 @@ class ANI1(AtomsDataModule):
         tar_path = os.path.join(tmpdir, "ANI1_release.tar.gz")
         raw_path = os.path.join(tmpdir, "data")
         url = "https://ndownloader.figshare.com/files/9057631"
-
-        request.urlretrieve(url, tar_path)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, stream=True)
+        response.raise_for_status()
+        with open(tar_path, "wb") as out_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                out_file.write(chunk)
         logging.info("Done.")
 
         tar = tarfile.open(tar_path)

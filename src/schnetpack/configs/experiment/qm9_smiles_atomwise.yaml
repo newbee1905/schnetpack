@@ -2,7 +2,7 @@
 
 defaults:
   - override /model: nnp
-  - override /data: qm9
+  - override /data: qm9_smiles
 
 run:
   experiment: qm9_${globals.property}

@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - qm9_jepa_v2
+
+run:
+  experiment: qm9_jepa_v2_no_detach
+
+model:
+  output_modules:
+    - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput
+      name: R_pred
+      target_property: R_real
+      predict_embeddings: False
+      lmbd: 10.0
+    - _target_: schnetpack.atomistic.JepaAtomwise
+      output_key: ${globals.property}
+      n_in: ${model.representation.n_atom_basis}
+      aggregation_mode: ${globals.aggregation}
+      latent_key: energy_latent
+      detach_latent: False
+      predictor:
+        _target_: schnetpack.nn.build_mlp
+        n_in: ${globals.n_latent}
+        n_out: ${globals.n_latent}
+        n_layers: 2
+    - _target_: schnetpack.atomistic.jepa.JepaLatentOutput
+      name: latent_match
+      latent_key: energy_latent
+      n_latents: ${globals.n_latent}
+      loss_weight: 0.1

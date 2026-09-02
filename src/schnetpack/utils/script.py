@@ -32,7 +32,7 @@ def log_hyperparameters(
     """
 
     # send hparams to all loggers
-    trainer.logger.log_hyperparams(config)
+    trainer.logger.log_hyperparams(todict(config))
 
     # disable logging any more hyperparameters for all loggers
     trainer.logger.log_hyperparams = empty
