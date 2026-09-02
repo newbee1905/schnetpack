@@ -5,8 +5,10 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 from typing import List, Optional, Dict
-from urllib import request as request
+
+import requests
 
 import numpy as np
 from ase import Atoms
@@ -33,6 +35,17 @@ class QM9(AtomsDataModule):
         .. [#qm9_1] https://ndownloader.figshare.com/files/3195404
 
     """
+
+    base_urls = [
+        "https://ndownloader.figshare.com/files/",
+        "https://api.figshare.com/v2/file/download/",
+        "https://springernature.figshare.com/ndownloader/files/",
+    ]
+    file_ids = {
+        "data": "3195389",
+        "atomrefs": "3195395",
+        "uncharacterized": "3195404",
+    }
 
     # properties
     A = "rotational_constant_A"
@@ -127,6 +140,57 @@ class QM9(AtomsDataModule):
 
         self.remove_uncharacterized = remove_uncharacterized
 
+    def _download_file(self, file_id: str, destination: str, n_retries: int = 5):
+        """Fetch a figshare file id, trying each mirror in `base_urls` in turn.
+
+        figshare answers a request it cannot serve immediately with a bare 202
+        (accepted, still being prepared) and an empty body, which
+        `urllib.request.urlretrieve` happily writes out as a 0-byte file. Poll
+        past the 202 with a short backoff before falling through to the next
+        mirror.
+
+        Note that figshare returns 202 indefinitely for requests carrying a
+        browser-like User-Agent, so this deliberately sends no custom headers.
+        """
+        session = requests.Session()
+
+        for base_url in self.base_urls:
+            url = f"{base_url}{file_id}"
+            logging.info(f"Attempting to download from {url}...")
+
+            for attempt in range(n_retries):
+                try:
+                    response = session.get(url, stream=True, timeout=30)
+                except Exception as e:
+                    logging.warning(f"Request to {url} failed: {e}")
+                    break
+
+                if response.status_code == 200:
+                    with open(destination, "wb") as out_file:
+                        for chunk in response.iter_content(chunk_size=1 << 16):
+                            out_file.write(chunk)
+                    logging.info(f"Downloaded {file_id} to {destination}")
+                    return
+
+                if response.status_code == 202:
+                    delay = 2 * (attempt + 1)
+                    logging.warning(
+                        f"Got 202 from {url} (file not ready), "
+                        f"retrying in {delay}s ({attempt + 1}/{n_retries})..."
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logging.warning(
+                    f"Download from {url} failed with status {response.status_code}"
+                )
+                break
+
+        raise AtomsDataModuleError(
+            f"Could not download file with id {file_id} from any of: "
+            + ", ".join(self.base_urls)
+        )
+
     def prepare_data(self):
         if not os.path.exists(self.datapath):
             property_unit_dict = {
@@ -179,9 +243,8 @@ class QM9(AtomsDataModule):
 
     def _download_uncharacterized(self, tmpdir):
         logging.info("Downloading list of uncharacterized molecules...")
-        at_url = "https://ndownloader.figshare.com/files/3195404"
         tmp_path = os.path.join(tmpdir, "uncharacterized.txt")
-        request.urlretrieve(at_url, tmp_path)
+        self._download_file(self.file_ids["uncharacterized"], tmp_path)
         logging.info("Done.")
 
         uncharacterized = []
@@ -193,9 +256,8 @@ class QM9(AtomsDataModule):
 
     def _download_atomrefs(self, tmpdir):
         logging.info("Downloading GDB-9 atom references...")
-        at_url = "https://ndownloader.figshare.com/files/3195395"
         tmp_path = os.path.join(tmpdir, "atomrefs.txt")
-        request.urlretrieve(at_url, tmp_path)
+        self._download_file(self.file_ids["atomrefs"], tmp_path)
         logging.info("Done.")
 
         props = [QM9.zpve, QM9.U0, QM9.U, QM9.H, QM9.G, QM9.Cv]
@@ -214,9 +276,7 @@ class QM9(AtomsDataModule):
         logging.info("Downloading GDB-9 data...")
         tar_path = os.path.join(tmpdir, "gdb9.tar.gz")
         raw_path = os.path.join(tmpdir, "gdb9_xyz")
-        url = "https://ndownloader.figshare.com/files/3195389"
-
-        request.urlretrieve(url, tar_path)
+        self._download_file(self.file_ids["data"], tar_path)
         logging.info("Done.")
 
         logging.info("Extracting files...")
@@ -227,7 +287,7 @@ class QM9(AtomsDataModule):
 
         logging.info("Parse xyz files...")
         ordered_files = sorted(
-            os.listdir(raw_path), key=lambda x: (int(re.sub("\D", "", x)), x)
+            os.listdir(raw_path), key=lambda x: (int(re.sub(r"\D", "", x)), x)
         )
 
         property_list = []
