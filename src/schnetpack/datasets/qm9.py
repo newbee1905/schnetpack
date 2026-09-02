@@ -265,9 +265,9 @@ class QM9(AtomsDataModule):
     """
 
     base_urls = [
-        "https://figshare.com/ndownloader/files/",
-        "https://springernature.figshare.com/ndownloader/files/",
         "https://ndownloader.figshare.com/files/",
+        "https://api.figshare.com/v2/file/download/",
+        "https://springernature.figshare.com/ndownloader/files/",
     ]
     file_ids = {
         "data": "3195389",
@@ -378,53 +378,96 @@ class QM9(AtomsDataModule):
         self.distance_threshold = distance_threshold
         self.store_both_geometries = store_both_geometries
 
-    def _download_file(self, file_id: str, destination: str):
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://figshare.com/",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
+    def _download_file(
+        self,
+        file_id: str,
+        destination: str,
+        n_retries: int = 8,
+        timeout: tuple = (10, 120),
+    ):
+        """Fetch a figshare file id, trying each mirror in `base_urls` in turn.
+
+        figshare answers a request it cannot serve immediately with a bare 202
+        (accepted, still being prepared) and an empty body, which
+        `urllib.request.urlretrieve` happily writes out as a 0-byte file. Poll
+        past the 202 before falling through to the next mirror.
+
+        The gdb9 archive is ~86 MB and figshare redirects to S3, which stalls
+        mid-body on a slow link. Body reads are therefore retried too, resuming
+        with a Range request so a stall does not discard what already landed.
+
+        Note that figshare returns 202 indefinitely for requests carrying a
+        browser-like User-Agent, so this deliberately sends no custom headers.
+        """
         session = requests.Session()
-        session.headers.update(headers)
 
         for base_url in self.base_urls:
-            # S3 bucket uses filenames, figshare uses IDs
             url = f"{base_url}{file_id}"
-
             logging.info(f"Attempting to download from {url}...")
-            try:
-                response = session.get(url, stream=True, timeout=10)
-                if response.status_code == 202:
-                    logging.warning(
-                        f"Got 202 from {url}, waiting 2 seconds and retrying..."
-                    )
-                    time.sleep(2)
-                    response = session.get(url, stream=True, timeout=10)
 
-                if response.status_code == 200:
-                    logging.info(
-                        f"Connected to {url}. Final URL: {response.url}. Status: {response.status_code}"
-                    )
-                    with open(destination, "wb") as out_file:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            out_file.write(chunk)
-                    logging.info(f"Successfully downloaded {file_id} to {destination}")
-                    return
-                else:
-                    logging.warning(
-                        f"Download from {url} failed with status {response.status_code}"
-                    )
-            except Exception as e:
-                logging.warning(
-                    f"Could not download from {url}, trying next source... Error: {e}"
+            for attempt in range(n_retries):
+                resume_at = (
+                    os.path.getsize(destination) if os.path.exists(destination) else 0
                 )
-            time.sleep(1)
+                headers = {"Range": f"bytes={resume_at}-"} if resume_at else {}
+
+                try:
+                    response = session.get(
+                        url, stream=True, timeout=timeout, headers=headers
+                    )
+
+                    if response.status_code == 202:
+                        delay = 2 * (attempt + 1)
+                        logging.warning(
+                            f"Got 202 from {url} (file not ready), retrying in "
+                            f"{delay}s ({attempt + 1}/{n_retries})..."
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    if response.status_code not in (200, 206):
+                        logging.warning(
+                            f"Download from {url} failed with status "
+                            f"{response.status_code}"
+                        )
+                        break
+
+                    # 206 means the server honoured the Range and we can append;
+                    # a 200 in reply to a Range request means it ignored it, so
+                    # start the file over.
+                    appending = response.status_code == 206 and resume_at > 0
+                    if resume_at and not appending:
+                        logging.info(f"{url} ignored Range, restarting download")
+                        resume_at = 0
+
+                    with open(destination, "ab" if appending else "wb") as out_file:
+                        for chunk in response.iter_content(chunk_size=1 << 16):
+                            out_file.write(chunk)
+
+                    logging.info(
+                        f"Downloaded {file_id} to {destination} "
+                        f"({os.path.getsize(destination)} bytes)"
+                    )
+                    return
+
+                except Exception as e:
+                    got = (
+                        os.path.getsize(destination)
+                        if os.path.exists(destination)
+                        else 0
+                    )
+                    delay = 2 * (attempt + 1)
+                    logging.warning(
+                        f"Transfer from {url} interrupted after {got} bytes "
+                        f"({type(e).__name__}: {e}); resuming in {delay}s "
+                        f"({attempt + 1}/{n_retries})..."
+                    )
+                    time.sleep(delay)
+                    continue
+
         raise AtomsDataModuleError(
-            f"Could not download file with id {file_id} from any source."
+            f"Could not download file with id {file_id} from any of: "
+            + ", ".join(self.base_urls)
         )
 
     # def prepare_data(self):
@@ -607,7 +650,7 @@ class QM9(AtomsDataModule):
 
         logging.info("Parse xyz files...")
         ordered_files = sorted(
-            os.listdir(raw_path), key=lambda x: (int(re.sub("\D", "", x)), x)
+            os.listdir(raw_path), key=lambda x: (int(re.sub(r"\D", "", x)), x)
         )
 
         # Prepare tasks for the multiprocessing pool
