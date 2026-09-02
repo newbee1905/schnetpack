@@ -140,14 +140,23 @@ class QM9(AtomsDataModule):
 
         self.remove_uncharacterized = remove_uncharacterized
 
-    def _download_file(self, file_id: str, destination: str, n_retries: int = 5):
+    def _download_file(
+        self,
+        file_id: str,
+        destination: str,
+        n_retries: int = 8,
+        timeout: tuple = (10, 120),
+    ):
         """Fetch a figshare file id, trying each mirror in `base_urls` in turn.
 
         figshare answers a request it cannot serve immediately with a bare 202
         (accepted, still being prepared) and an empty body, which
         `urllib.request.urlretrieve` happily writes out as a 0-byte file. Poll
-        past the 202 with a short backoff before falling through to the next
-        mirror.
+        past the 202 before falling through to the next mirror.
+
+        The gdb9 archive is ~86 MB and figshare redirects to S3, which stalls
+        mid-body on a slow link. Body reads are therefore retried too, resuming
+        with a Range request so a stall does not discard what already landed.
 
         Note that figshare returns 202 indefinitely for requests carrying a
         browser-like User-Agent, so this deliberately sends no custom headers.
@@ -159,32 +168,64 @@ class QM9(AtomsDataModule):
             logging.info(f"Attempting to download from {url}...")
 
             for attempt in range(n_retries):
-                try:
-                    response = session.get(url, stream=True, timeout=30)
-                except Exception as e:
-                    logging.warning(f"Request to {url} failed: {e}")
-                    break
+                resume_at = (
+                    os.path.getsize(destination) if os.path.exists(destination) else 0
+                )
+                headers = {"Range": f"bytes={resume_at}-"} if resume_at else {}
 
-                if response.status_code == 200:
-                    with open(destination, "wb") as out_file:
+                try:
+                    response = session.get(
+                        url, stream=True, timeout=timeout, headers=headers
+                    )
+
+                    if response.status_code == 202:
+                        delay = 2 * (attempt + 1)
+                        logging.warning(
+                            f"Got 202 from {url} (file not ready), retrying in "
+                            f"{delay}s ({attempt + 1}/{n_retries})..."
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    if response.status_code not in (200, 206):
+                        logging.warning(
+                            f"Download from {url} failed with status "
+                            f"{response.status_code}"
+                        )
+                        break
+
+                    # 206 means the server honoured the Range and we can append;
+                    # a 200 in reply to a Range request means it ignored it, so
+                    # start the file over.
+                    appending = response.status_code == 206 and resume_at > 0
+                    if resume_at and not appending:
+                        logging.info(f"{url} ignored Range, restarting download")
+                        resume_at = 0
+
+                    with open(destination, "ab" if appending else "wb") as out_file:
                         for chunk in response.iter_content(chunk_size=1 << 16):
                             out_file.write(chunk)
-                    logging.info(f"Downloaded {file_id} to {destination}")
+
+                    logging.info(
+                        f"Downloaded {file_id} to {destination} "
+                        f"({os.path.getsize(destination)} bytes)"
+                    )
                     return
 
-                if response.status_code == 202:
+                except Exception as e:
+                    got = (
+                        os.path.getsize(destination)
+                        if os.path.exists(destination)
+                        else 0
+                    )
                     delay = 2 * (attempt + 1)
                     logging.warning(
-                        f"Got 202 from {url} (file not ready), "
-                        f"retrying in {delay}s ({attempt + 1}/{n_retries})..."
+                        f"Transfer from {url} interrupted after {got} bytes "
+                        f"({type(e).__name__}: {e}); resuming in {delay}s "
+                        f"({attempt + 1}/{n_retries})..."
                     )
                     time.sleep(delay)
                     continue
-
-                logging.warning(
-                    f"Download from {url} failed with status {response.status_code}"
-                )
-                break
 
         raise AtomsDataModuleError(
             f"Could not download file with id {file_id} from any of: "
