@@ -12,6 +12,8 @@ __all__ = [
     "SubtractCenterOfGeometry",
     "AddOffsets",
     "RemoveOffsets",
+    "AddGroupOffsets",
+    "RemoveGroupOffsets",
     "ScaleProperty",
 ]
 
@@ -26,12 +28,14 @@ class SubtractCenterOfMass(Transform):
 
     def __init__(self):
         super().__init__()
+        # Register atomic_masses as a buffer
+        self.register_buffer("atomic_masses_buffer", torch.tensor(atomic_masses, dtype=torch.float32))
 
     def forward(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        masses = torch.tensor(atomic_masses[inputs[structure.Z]])
+        masses = self.atomic_masses_buffer[inputs[structure.Z]]
         inputs[structure.position] -= (
             masses.unsqueeze(-1) * inputs[structure.position]
         ).sum(0) / masses.sum()
@@ -110,7 +114,7 @@ class RemoveOffsets(Transform):
             self._mean_initialized = False
 
         if self.remove_atomrefs:
-            atomrefs = atomrefs or torch.zeros((zmax,))
+            atomrefs = atomrefs if atomrefs is not None else torch.zeros((zmax,))
             self.register_buffer("atomref", atomrefs)
         if self.remove_mean:
             property_mean = property_mean or torch.zeros((1,))
@@ -149,9 +153,8 @@ class RemoveOffsets(Transform):
         if self.remove_atomrefs:
             atomref_bias = torch.sum(self.atomref[inputs[structure.Z]])
             if not self.is_extensive:
-                atomref_bias /= inputs[structure.n_atoms].item()
+                atomref_bias = atomref_bias / inputs[structure.n_atoms]
             inputs[self._property] -= atomref_bias
-
         return inputs
 
 
@@ -275,7 +278,7 @@ class AddOffsets(Transform):
         else:
             self._mean_initialized = False
 
-        atomrefs = atomrefs or torch.zeros((zmax,))
+        atomrefs = atomrefs if atomrefs is not None else torch.zeros((zmax,))
         property_mean = property_mean or torch.zeros((1,))
         self.register_buffer("atomref", atomrefs)
         self.register_buffer("mean", property_mean)
@@ -320,4 +323,113 @@ class AddOffsets(Transform):
 
             inputs[self._property] += y0
 
+        return inputs
+
+
+class RemoveGroupOffsets(Transform):
+    """
+    Remove offsets from property based on the mean of each group/state (e.g. reactants, ts, products).
+    """
+
+    is_preprocessor: bool = True
+    is_postprocessor: bool = True
+
+    def __init__(
+        self,
+        property,
+        group_key: str = "state_idx",
+        is_extensive: bool = True,
+        means: torch.Tensor = None,
+    ):
+        super().__init__()
+        self._property = property
+        self.group_key = group_key
+        self.is_extensive = is_extensive
+
+        if means is not None:
+            self._initialized = True
+        else:
+            self._initialized = False
+
+        means = means or torch.zeros((3,))
+        self.register_buffer("means", means)
+
+    def datamodule(self, datamodule):
+        if not self._initialized:
+            # We assume the datamodule has a get_group_stats method or similar
+            # For RGD1Single, we will implement this.
+            if hasattr(datamodule, "get_group_stats"):
+                self.means = datamodule.get_group_stats(
+                    self._property, self.is_extensive
+                ).detach()
+            else:
+                # Fallback to global mean if group stats not available
+                stats = datamodule.get_stats(self._property, self.is_extensive, True)
+                self.means = stats[0].detach().repeat(3) # Assumes 3 states
+
+    def forward(
+        self,
+        inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        group_idx = inputs[self.group_key]
+        means = self.means[group_idx]
+        if self.is_extensive:
+            means = means * inputs[structure.n_atoms]
+        
+        # Ensure means matches the dimensionality of the property
+        means = means.view_as(inputs[self._property])
+        inputs[self._property] -= means
+        return inputs
+
+
+class AddGroupOffsets(Transform):
+    """
+    Add offsets to property based on the mean of each group/state (e.g. reactants, ts, products).
+    """
+
+    is_preprocessor: bool = True
+    is_postprocessor: bool = True
+
+    def __init__(
+        self,
+        property,
+        group_key: str = "state_idx",
+        is_extensive: bool = True,
+        means: torch.Tensor = None,
+    ):
+        super().__init__()
+        self._property = property
+        self.group_key = group_key
+        self.is_extensive = is_extensive
+
+        if means is not None:
+            self._initialized = True
+        else:
+            self._initialized = False
+
+        means = means or torch.zeros((3,))
+        self.register_buffer("means", means)
+
+    def datamodule(self, datamodule):
+        if not self._initialized:
+            if hasattr(datamodule, "get_group_stats"):
+                self.means = datamodule.get_group_stats(
+                    self._property, self.is_extensive
+                ).detach()
+            else:
+                stats = datamodule.get_stats(self._property, self.is_extensive, True)
+                self.means = stats[0].detach().repeat(3)
+
+    def forward(
+        self,
+        inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        group_idx = inputs[self.group_key]
+        means = self.means[group_idx]
+        if self.is_extensive:
+            means = means * inputs[structure.n_atoms]
+
+        # Ensure means matches the dimensionality of the property
+        means = means.view_as(inputs[self._property])
+        inputs[self._property] += means
         return inputs

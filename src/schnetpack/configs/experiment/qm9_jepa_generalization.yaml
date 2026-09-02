@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - qm9_jepa_detached
+
+run:
+  experiment: qm9_jepa_generalization
+
+data:
+  # Using 0.5 train, 0.1 val, 0.4 test
+  # For 133885 molecules (if remove_uncharacterized=True, ~130831)
+  # Roughly:
+  num_train: 65000
+  num_val: 13000
+  num_test: 52000

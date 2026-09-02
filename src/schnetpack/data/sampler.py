@@ -4,7 +4,7 @@ import numpy as np
 from torch.utils.data import Sampler, WeightedRandomSampler
 
 from schnetpack import properties
-from schnetpack.data import BaseAtomsData
+from schnetpack.data.base import BaseAtomsData
 
 
 __all__ = [

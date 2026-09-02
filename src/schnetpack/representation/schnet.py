@@ -30,12 +30,14 @@ class SchNetInteraction(nn.Module):
         """
         super(SchNetInteraction, self).__init__()
         self.in2f = Dense(n_atom_basis, n_filters, bias=False, activation=None)
+
         self.f2out = nn.Sequential(
             Dense(n_filters, n_atom_basis, activation=activation),
             Dense(n_atom_basis, n_atom_basis, activation=None),
         )
         self.filter_network = nn.Sequential(
-            Dense(n_rbf, n_filters, activation=activation), Dense(n_filters, n_filters)
+            Dense(n_rbf, n_filters, activation=activation),
+            Dense(n_filters, n_filters),
         )
 
     def forward(

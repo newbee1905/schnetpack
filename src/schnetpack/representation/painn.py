@@ -14,7 +14,14 @@ __all__ = ["PaiNN", "PaiNNInteraction", "PaiNNMixing"]
 class PaiNNInteraction(nn.Module):
     r"""PaiNN interaction block for modeling equivariant interactions of atomistic systems."""
 
-    def __init__(self, n_atom_basis: int, activation: Callable, epsilon: float = 1e-8, use_norm: bool = True):
+    def __init__(
+        self,
+        n_atom_basis: int,
+        activation: Callable,
+        epsilon: float = 1e-8,
+        use_norm: bool = False,
+        use_glu_variant: bool = False,
+    ):
         """
         Args:
             n_atom_basis: number of features to describe atomic environments.
@@ -27,9 +34,17 @@ class PaiNNInteraction(nn.Module):
         if self.use_norm:
             self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
             self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_mu = nn.Identity()
 
         self.interatomic_context_net = nn.Sequential(
-            snn.Dense(n_atom_basis, n_atom_basis, activation=activation),
+            snn.Dense(
+                n_atom_basis,
+                n_atom_basis,
+                activation=activation,
+                use_glu_variant=use_glu_variant,
+            ),
             snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
         )
 
@@ -55,6 +70,7 @@ class PaiNNInteraction(nn.Module):
         Returns:
             atom features after interaction
         """
+
         q_in = q
         mu_in = mu
         
@@ -66,7 +82,6 @@ class PaiNNInteraction(nn.Module):
         x = self.interatomic_context_net(q_in)
         xj = x[idx_j]
         muj = mu_in[idx_j]
-
         x = Wij * xj
 
         dq, dmuR, dmumu = torch.split(x, self.n_atom_basis, dim=-1)
@@ -83,7 +98,14 @@ class PaiNNInteraction(nn.Module):
 class PaiNNMixing(nn.Module):
     r"""PaiNN interaction block for mixing on atom features."""
 
-    def __init__(self, n_atom_basis: int, activation: Callable, epsilon: float = 1e-8, use_norm: float = True):
+    def __init__(
+        self,
+        n_atom_basis: int,
+        activation: Callable,
+        epsilon: float = 1e-8,
+        use_norm: bool = False,
+        use_glu_variant: bool = False,
+    ):
         """
         Args:
             n_atom_basis: number of features to describe atomic environments.
@@ -93,13 +115,23 @@ class PaiNNMixing(nn.Module):
         super(PaiNNMixing, self).__init__()
         self.n_atom_basis = n_atom_basis
         self.use_norm = use_norm
+        self.use_glu_variant = use_glu_variant
+
         if self.use_norm:
             self.norm_q = snn.RMSNorm(n_atom_basis, eps=epsilon)
             self.norm_mu = snn.EquivariantRMSNorm(n_atom_basis, eps=epsilon)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_mu = nn.Identity()
 
         self.intraatomic_context_net = nn.Sequential(
-            snn.Dense(2 * n_atom_basis, n_atom_basis, activation=activation),
-            snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None, weight_init=nn.init.zeros_),
+            snn.Dense(
+                2 * n_atom_basis,
+                n_atom_basis,
+                activation=activation,
+                use_glu_variant=use_glu_variant,
+            ),
+            snn.Dense(n_atom_basis, 3 * n_atom_basis, activation=None),
         )
         self.mu_channel_mix = snn.Dense(
             n_atom_basis, 2 * n_atom_basis, activation=None, bias=False
@@ -127,14 +159,9 @@ class PaiNNMixing(nn.Module):
         ## intra-atomic
         mu_mix = self.mu_channel_mix(mu_in)
         mu_V, mu_W = torch.split(mu_mix, self.n_atom_basis, dim=-1)
+        mu_Vn = torch.sqrt(torch.sum(mu_V**2, dim=-2, keepdim=True) + self.epsilon)
 
-        # Use Squared Norm directly. 
-        # Avoids sqrt() singularity near 0 and saves compute.
-        mu_V_sq = torch.sum(mu_V**2, dim=-2, keepdim=True)
-        # mu_Vn = torch.sqrt(torch.sum(mu_V**2, dim=-2, keepdim=True) + self.epsilon)
-
-        # ctx = torch.cat([q, mu_Vn], dim=-1)
-        ctx = torch.cat([q_in, mu_V_sq], dim=-1)
+        ctx = torch.cat([q_in, mu_Vn], dim=-1)
         x = self.intraatomic_context_net(ctx)
 
         dq_intra, dmu_intra, dqmu_intra = torch.split(x, self.n_atom_basis, dim=-1)
@@ -168,9 +195,10 @@ class PaiNN(nn.Module):
         shared_interactions: bool = False,
         shared_filters: bool = False,
         epsilon: float = 1e-8,
-        use_norm: bool = True,
         nuclear_embedding: Optional[nn.Module] = None,
         electronic_embeddings: Optional[List] = None,
+        use_norm: bool = False,
+        use_glu_variant: bool = False,
     ):
         """
         Args:
@@ -188,6 +216,9 @@ class PaiNN(nn.Module):
             nuclear_embedding: custom nuclear embedding (e.g. spk.nn.embeddings.NuclearEmbedding)
             electronic_embeddings: list of electronic embeddings. E.g. for spin and
                 charge (see spk.nn.embeddings.ElectronicEmbedding)
+            use_norm: if True, pre-normalize q and mu at the input of each block.
+            use_glu_variant: if True, use a gated-linear-unit variant for the
+                activated Dense layers inside the interaction/mixing blocks.
         """
         super(PaiNN, self).__init__()
 
@@ -196,6 +227,7 @@ class PaiNN(nn.Module):
         self.cutoff_fn = cutoff_fn
         self.cutoff = cutoff_fn.cutoff
         self.radial_basis = radial_basis
+        self.epsilon = epsilon
 
         # initialize embeddings
         if nuclear_embedding is None:
@@ -210,7 +242,7 @@ class PaiNN(nn.Module):
         self.share_filters = shared_filters
         if shared_filters:
             self.filter_net = snn.Dense(
-                self.radial_basis.n_rbf, 3 * n_atom_basis, activation=None, 
+                self.radial_basis.n_rbf, 3 * n_atom_basis, activation=None
             )
         else:
             self.filter_net = snn.Dense(
@@ -222,14 +254,22 @@ class PaiNN(nn.Module):
         # initialize interaction blocks
         self.interactions = snn.replicate_module(
             lambda: PaiNNInteraction(
-                n_atom_basis=self.n_atom_basis, activation=activation, epsilon=epsilon, use_norm=use_norm
+                n_atom_basis=self.n_atom_basis,
+                activation=activation,
+                epsilon=epsilon,
+                use_glu_variant=use_glu_variant,
+                use_norm=use_norm,
             ),
             self.n_interactions,
             shared_interactions,
         )
         self.mixing = snn.replicate_module(
             lambda: PaiNNMixing(
-                n_atom_basis=self.n_atom_basis, activation=activation, epsilon=epsilon, use_norm=use_norm
+                n_atom_basis=self.n_atom_basis,
+                activation=activation,
+                epsilon=epsilon,
+                use_glu_variant=use_glu_variant,
+                use_norm=use_norm,
             ),
             self.n_interactions,
             shared_interactions,
@@ -255,7 +295,7 @@ class PaiNN(nn.Module):
         n_atoms = atomic_numbers.shape[0]
 
         # compute atom and pair features
-        d_ij = torch.norm(r_ij, dim=1, keepdim=True)
+        d_ij = torch.sqrt(torch.sum(r_ij**2, dim=-1, keepdim=True) + self.epsilon)
         dir_ij = r_ij / d_ij
         phi_ij = self.radial_basis(d_ij)
         fcut = self.cutoff_fn(d_ij)
@@ -275,7 +315,6 @@ class PaiNN(nn.Module):
         # compute interaction blocks and update atomic embeddings
         qs = q.shape
         mu = torch.zeros((qs[0], 3, qs[2]), device=q.device)
-        # mu = torch.zeros((qs[0], 3, qs[1]), device=q.device)
         for i, (interaction, mixing) in enumerate(zip(self.interactions, self.mixing)):
             q, mu = interaction(q, mu, filter_list[i], dir_ij, idx_i, idx_j, n_atoms)
             q, mu = mixing(q, mu)
@@ -286,5 +325,5 @@ class PaiNN(nn.Module):
         inputs["vector_representation"] = mu
 
         return inputs
-
-# vi:ts=4 sw=4 et
+#
+# vi: set ts=4 sw=4 expandtab:

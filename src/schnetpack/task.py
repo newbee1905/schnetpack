@@ -7,6 +7,7 @@ from torch import nn as nn
 from torchmetrics import Metric
 
 from schnetpack.model.base import AtomisticModel
+import schnetpack.properties as properties
 
 __all__ = ["ModelOutput", "AtomisticTask"]
 
@@ -86,6 +87,108 @@ class UnsupervisedModelOutput(ModelOutput):
     def update_metrics(self, pred, target, subset):
         for metric in self.metrics[subset].values():
             metric(pred[self.name])
+
+
+class GroupedEnergyOutput(ModelOutput):
+    def __init__(
+        self,
+        name: str,
+        target_property: str,
+        loss_weight: float = 1.0,
+        metrics: Optional[Dict[str, Metric]] = None,
+        loss_fn: Optional[torch.nn.Module] = None,
+    ):
+        super().__init__(
+            name=name,
+            target_property=target_property,
+            loss_fn=loss_fn or torch.nn.MSELoss(),
+            loss_weight=loss_weight,
+            metrics=metrics,
+        )
+
+    def calculate_loss(self, pred, target):
+        if self.name not in pred or self.target_property not in target:
+            return torch.tensor(0.0, device=pred[list(pred.keys())[0]].device, requires_grad=True)
+
+        loss = self.loss_fn(pred[self.name], target[self.target_property])
+        return self.loss_weight * loss
+
+    def update_metrics(self, pred, target, subset):
+        for metric in self.metrics[subset].values():
+            if getattr(metric, "is_delta_e", False):
+                # Calculate Delta E (Barrier) performance
+                # This requires samples from the same reaction to be in the same batch.
+                
+                # Check for index and state_idx in prediction or target
+                idxs = pred.get(properties.idx)
+                if idxs is None:
+                    idxs = target.get(properties.idx)
+                
+                state_idxs = target.get("state_idx")
+                
+                if idxs is None or state_idxs is None:
+                    logging.warning("Could not find properties.idx or state_idx in pred or target. Skipping Delta E metric.")
+                    continue
+
+                idxs = idxs.squeeze()
+                state_idxs = state_idxs.squeeze()
+                if idxs.ndim == 0 or state_idxs.ndim == 0:
+                    continue
+                
+                # We need to find the number of states to map back to reaction index
+                # In RGD1Single, n_states is len(states)
+                # However, since we might not know n_states here, we use the property that 
+                # for RGD1, reactions are contiguous in the flattened dataset.
+                # Actually, a safer way is to use the fact that state_idx 0 is reactant and 2 is TS
+                # if we follow the [reactant, products, ts] or [reactant, ts, products] convention.
+                # For RGD1, state_idx 0 is always reactant, 1 product, 2 TS in the 3-state case.
+                # If only 2 states [reactants, ts] are used, state_idx 0 is reactant, 1 is ts.
+                
+                # Find reactants and TS based on their names if available, or assume 0 and max
+                # A more general way: reactant is the FIRST state, TS is usually the last or specifically tagged.
+                # Given the RGD1Single implementation:
+                # 0: reactants, 1: products, 2: ts (default)
+                # If only [reactants, ts], then 0: reactants, 1: ts.
+                
+                # Find reactant (0) and find TS (highest index or specifically 2)
+                r_mask = state_idxs == 0
+                ts_mask = (state_idxs == 2) | ((state_idxs == 1) & (state_idxs.max() == 1))
+                
+                if r_mask.any() and ts_mask.any():
+                    # Map to reaction index. In RGD1Single, rxn_idx = idx // n_states
+                    # We can find n_states from state_idxs.max() + 1
+                    n_states = int(state_idxs.max().item()) + 1
+                    rxn_idxs = idxs // n_states
+                    
+                    r_rxns = rxn_idxs[r_mask]
+                    ts_rxns = rxn_idxs[ts_mask]
+                    
+                    # Find common reactions
+                    common_rxns = np.intersect1d(r_rxns.cpu().numpy(), ts_rxns.cpu().numpy())
+                    
+                    if len(common_rxns) > 0:
+                        p_delta_e = []
+                        t_delta_e = []
+                        
+                        for rxn in common_rxns:
+                            # Use actual masks to find the correct samples in the batch
+                            r_match = (rxn_idxs == rxn) & r_mask
+                            ts_match = (rxn_idxs == rxn) & ts_mask
+                            
+                            if r_match.any() and ts_match.any():
+                                r_idx_in_batch = torch.where(r_match)[0][0]
+                                ts_idx_in_batch = torch.where(ts_match)[0][0]
+                                
+                                p_delta_e.append(pred[self.name][ts_idx_in_batch] - pred[self.name][r_idx_in_batch])
+                                t_delta_e.append(target[self.target_property][ts_idx_in_batch] - target[self.target_property][r_idx_in_batch])
+                        
+                        if len(p_delta_e) > 0:
+                            metric(torch.stack(p_delta_e).detach().cpu(), torch.stack(t_delta_e).detach().cpu())
+            else:
+                metric(
+                    pred[self.name].detach().cpu(),
+                    target[self.target_property].detach().cpu(),
+                )
 
 
 class AtomisticTask(pl.LightningModule):
@@ -171,6 +274,9 @@ class AtomisticTask(pl.LightningModule):
             for output in self.outputs
             if not isinstance(output, UnsupervisedModelOutput)
         }
+        for k in [properties.idx, properties.idx_m, properties.n_atoms]:
+            if k in batch:
+                targets[k] = batch[k]
         try:
             targets["considered_atoms"] = batch["considered_atoms"]
         except:
@@ -183,6 +289,12 @@ class AtomisticTask(pl.LightningModule):
 
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log_metrics(pred, targets, "train")
+
+        # Log extra scalar losses from pred
+        for k, v in pred.items():
+            if k.endswith("_loss") and isinstance(v, torch.Tensor) and v.ndim == 0:
+                self.log(f"train_{k}", v, on_step=True, on_epoch=False, prog_bar=False)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -193,6 +305,9 @@ class AtomisticTask(pl.LightningModule):
             for output in self.outputs
             if not isinstance(output, UnsupervisedModelOutput)
         }
+        for k in [properties.idx, properties.idx_m, properties.n_atoms]:
+            if k in batch:
+                targets[k] = batch[k]
         try:
             targets["considered_atoms"] = batch["considered_atoms"]
         except:
@@ -214,6 +329,11 @@ class AtomisticTask(pl.LightningModule):
         )
         self.log_metrics(pred, targets, "val")
 
+        # Log extra scalar losses from pred
+        for k, v in pred.items():
+            if k.endswith("_loss") and isinstance(v, torch.Tensor) and v.ndim == 0:
+                self.log(f"val_{k}", v, on_step=False, on_epoch=True, prog_bar=False)
+
         return {"val_loss": loss}
 
     def test_step(self, batch, batch_idx):
@@ -224,6 +344,9 @@ class AtomisticTask(pl.LightningModule):
             for output in self.outputs
             if not isinstance(output, UnsupervisedModelOutput)
         }
+        for k in [properties.idx, properties.idx_m, properties.n_atoms]:
+            if k in batch:
+                targets[k] = batch[k]
         try:
             targets["considered_atoms"] = batch["considered_atoms"]
         except:
@@ -244,6 +367,12 @@ class AtomisticTask(pl.LightningModule):
             sync_dist=True,
         )
         self.log_metrics(pred, targets, "test")
+
+        # Log extra scalar losses from pred
+        for k, v in pred.items():
+            if k.endswith("_loss") and isinstance(v, torch.Tensor) and v.ndim == 0:
+                self.log(f"test_{k}", v, on_step=False, on_epoch=True, prog_bar=False)
+
         return {"test_loss": loss}
 
     def predict_without_postprocessing(self, batch):

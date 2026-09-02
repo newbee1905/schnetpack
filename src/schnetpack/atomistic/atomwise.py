@@ -8,7 +8,7 @@ import schnetpack as spk
 import schnetpack.nn as snn
 import schnetpack.properties as properties
 
-__all__ = ["Atomwise", "DipoleMoment", "Polarizability"]
+__all__ = ["Atomwise", "JepaAtomwise", "DipoleMoment", "Polarizability"]
 
 
 class Atomwise(nn.Module):
@@ -67,15 +67,22 @@ class Atomwise(nn.Module):
         self.aggregation_mode = aggregation_mode
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        # predict atomwise contributions
-        y = self.outnet(inputs["scalar_representation"])
+        # check for aggregated representation
+        if "aggregated_scalar_representation" in inputs:
+            y = self.outnet(inputs["aggregated_scalar_representation"])
+            # If we used aggregated input, we don't need to scatter_add later
+            skip_aggregation = True
+        else:
+            # predict atomwise contributions
+            y = self.outnet(inputs["scalar_representation"])
+            skip_aggregation = False
 
         # accumulate the per-atom output if necessary
         if self.per_atom_output_key is not None:
             inputs[self.per_atom_output_key] = y
 
         # aggregate
-        if self.aggregation_mode is not None:
+        if self.aggregation_mode is not None and not skip_aggregation:
             idx_m = inputs[properties.idx_m]
             maxm = int(idx_m[-1]) + 1
             y = snn.scatter_add(y, idx_m, dim_size=maxm)
@@ -83,6 +90,143 @@ class Atomwise(nn.Module):
 
             if self.aggregation_mode == "avg":
                 y = y / inputs[properties.n_atoms]
+
+        # If it was already aggregated but has an extra dimension, squeeze it
+        if skip_aggregation and self.aggregation_mode is not None:
+            y = torch.squeeze(y, -1)
+
+        inputs[self.output_key] = y
+        return inputs
+
+
+class JepaAtomwise(nn.Module):
+    """
+    Predicts atom-wise contributions and accumulates global prediction, e.g. for the energy.
+    Split MLP to create a latent space, which is detached before energy prediction.
+    Optionally includes a predictor for JEPA-style projection.
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int = 1,
+        n_hidden: Optional[Union[int, Sequence[int]]] = None,
+        n_layers: int = 2,
+        activation: Callable = F.silu,
+        aggregation_mode: str = "sum",
+        output_key: str = "y",
+        per_atom_output_key: Optional[str] = None,
+        latent_key: str = "latent",
+        predictor: Optional[nn.Module] = None,
+        detach_latent: bool = True,
+    ):
+        """
+        Args:
+            n_in: input dimension of representation
+            n_out: output dimension of target property (default: 1)
+            n_hidden: size of hidden layers.
+            n_layers: number of layers.
+            activation: activation function.
+            aggregation_mode: one of {sum, avg} (default: sum)
+            output_key: the key under which the result will be stored
+            per_atom_output_key: If not None, the key under which the per-atom result will be stored
+            latent_key: the key under which the latent representation will be stored
+            predictor: optional predictor network for JEPA
+            detach_latent: if True, detach latent before energy prediction (default: True)
+        """
+        super(JepaAtomwise, self).__init__()
+        self.output_key = output_key
+        self.model_outputs = [output_key]
+        self.per_atom_output_key = per_atom_output_key
+        if self.per_atom_output_key is not None:
+            self.model_outputs.append(self.per_atom_output_key)
+        self.n_out = n_out
+        self.latent_key = latent_key
+        self.model_outputs.append(self.latent_key)
+        self.detach_latent = detach_latent
+
+        if aggregation_mode is None and self.per_atom_output_key is None:
+            raise ValueError(
+                "If `aggregation_mode` is None, `per_atom_output_key` needs to be set,"
+                + " since no accumulated output will be returned!"
+            )
+
+        full_mlp = spk.nn.build_mlp(
+            n_in=n_in,
+            n_out=n_out,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        # Split MLP into first half (embedding) and second half (output)
+        n_half = max(1, n_layers // 2)
+        self.embedding_net = nn.Sequential(*full_mlp[:n_half])
+        self.output_net = nn.Sequential(*full_mlp[n_half:])
+
+        self.predictor = predictor
+        if self.predictor is not None:
+            self.model_outputs.append(f"{self.latent_key}_projected")
+
+        self.aggregation_mode = aggregation_mode
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # check for aggregated representation
+        if "aggregated_scalar_representation" in inputs:
+            v = inputs["aggregated_scalar_representation"]
+            skip_aggregation = True
+        else:
+            # predict atomwise contributions
+            v = inputs["scalar_representation"]
+            skip_aggregation = False
+
+        latent = self.embedding_net(v)
+        inputs[self.latent_key] = latent
+
+        # Optionally detach and send to output net for energy prediction
+        if self.detach_latent:
+            y = self.output_net(latent.detach())
+        else:
+            y = self.output_net(latent)
+
+        # Optional predictor/projection
+        if self.predictor is not None:
+            inputs[f"{self.latent_key}_projected"] = self.predictor(latent)
+        else:
+            inputs[f"{self.latent_key}_projected"] = latent
+
+        # Handle JEPA logic if both predicted and real representations are present
+        if not skip_aggregation and "z_pred" in inputs and "z_real" in inputs:
+            # Context latent from predicted representations
+            z_pred = inputs["z_pred"]
+            latent_pred = self.embedding_net(z_pred)
+            if self.predictor is not None:
+                inputs[f"{self.latent_key}_pred_projected"] = self.predictor(latent_pred)
+            else:
+                inputs[f"{self.latent_key}_pred_projected"] = latent_pred
+
+            # Target latent from real representations
+            z_real = inputs["z_real"]
+            latent_real = self.embedding_net(z_real)
+            inputs[f"{self.latent_key}_real"] = latent_real.detach()
+
+        # accumulate the per-atom output if necessary
+        if self.per_atom_output_key is not None:
+            inputs[self.per_atom_output_key] = y
+
+        # aggregate
+        if self.aggregation_mode is not None and not skip_aggregation:
+            idx_m = inputs[properties.idx_m]
+            maxm = int(idx_m[-1]) + 1
+            y = snn.scatter_add(y, idx_m, dim_size=maxm)
+            y = torch.squeeze(y, -1)
+
+            if self.aggregation_mode == "avg":
+                y = y / inputs[properties.n_atoms]
+
+        # If it was already aggregated but has an extra dimension, squeeze it
+        if skip_aggregation and self.aggregation_mode is not None:
+            y = torch.squeeze(y, -1)
 
         inputs[self.output_key] = y
         return inputs

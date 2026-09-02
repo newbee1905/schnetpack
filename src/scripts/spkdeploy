@@ -48,7 +48,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
-    model = torch.load(args.model_path, map_location=args.device)
+    model = torch.load(args.model_path, map_location=args.device, weights_only=False)
     save_jit_model(model, args.deployed_model_path)
 
     print(f"stored deployed model at {args.deployed_model_path}.")

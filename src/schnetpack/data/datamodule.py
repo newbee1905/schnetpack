@@ -9,17 +9,15 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import BatchSampler
 
-from schnetpack.data import (
+from schnetpack.data.atoms import (
     AtomsDataFormat,
     resolve_format,
     load_dataset,
-    BaseAtomsData,
-    AtomsLoader,
-    calculate_stats,
-    estimate_atomrefs,
-    SplittingStrategy,
-    RandomSplit,
 )
+from schnetpack.data.splitting import SplittingStrategy, RandomSplit
+from schnetpack.data.base import BaseAtomsData
+from schnetpack.data.loader import AtomsLoader
+from schnetpack.data.stats import calculate_stats
 
 
 __all__ = ["AtomsDataModule", "AtomsDataModuleError"]
@@ -128,7 +126,6 @@ class AtomsDataModule(pl.LightningDataModule):
         self.property_units = property_units
         self.distance_unit = distance_unit
         self._stats = {}
-        self._atomrefs = {}
         self._is_setup = False
         self.data_workdir = data_workdir
         self.cleanup_workdir_stage = cleanup_workdir_stage
@@ -255,19 +252,11 @@ class AtomsDataModule(pl.LightningDataModule):
             t.teardown()
 
     def _load_partitions(self):
-        # Split dataset
+        # split dataset
         lock = fasteners.InterProcessLock("splitting.lock")
 
         with lock:
             self._log_with_rank("Enter splitting lock")
-            # Convert relative sizes to absolute values
-            total_size = len(self.dataset)
-            if isinstance(self.num_train, float) and self.num_train <= 1:
-                self.num_train = int(self.num_train * total_size)
-            if isinstance(self.num_val, float) and self.num_val <= 1:
-                self.num_val = int(self.num_val * total_size)
-            if isinstance(self.num_test, float) and self.num_test <= 1:
-                self.num_test = int(self.num_test * total_size)
 
             if self.split_file is not None and os.path.exists(self.split_file):
                 self._log_with_rank("Load split")
@@ -276,27 +265,25 @@ class AtomsDataModule(pl.LightningDataModule):
                 self.train_idx = S["train_idx"].tolist()
                 self.val_idx = S["val_idx"].tolist()
                 self.test_idx = S["test_idx"].tolist()
-
-                # Validate if the split file matches the expected sizes
                 if self.num_train and self.num_train != len(self.train_idx):
-                    raise ValueError(
+                    logging.warning(
                         f"Split file was given, but `num_train ({self.num_train})"
                         + f" != len(train_idx)` ({len(self.train_idx)})!"
                     )
                 if self.num_val and self.num_val != len(self.val_idx):
-                    raise ValueError(
+                    logging.warning(
                         f"Split file was given, but `num_val ({self.num_val})"
                         + f" != len(val_idx)` ({len(self.val_idx)})!"
                     )
                 if self.num_test and self.num_test != len(self.test_idx):
-                    raise ValueError(
+                    logging.warning(
                         f"Split file was given, but `num_test ({self.num_test})"
                         + f" != len(test_idx)` ({len(self.test_idx)})!"
                     )
             else:
                 self._log_with_rank("Create split")
 
-                if not self.num_train or not self.num_val:
+                if self.num_train is None or self.num_val is None:
                     raise AtomsDataModuleError(
                         "If no `split_file` is given, the sizes of the training and"
                         + " validation partitions need to be set!"
@@ -370,20 +357,6 @@ class AtomsDataModule(pl.LightningDataModule):
         )[property]
         self._stats[key] = stats
         return stats
-
-    def get_atomrefs(
-        self, property: str, is_extensive: bool
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        key = (property, is_extensive)
-        if key in self._atomrefs:
-            return {property: self._atomrefs[key]}
-
-        atomrefs = estimate_atomrefs(
-            self.train_dataloader(),
-            is_extensive={property: is_extensive},
-        )[property]
-        self._atomrefs[key] = atomrefs
-        return {property: atomrefs}
 
     @property
     def train_dataset(self) -> BaseAtomsData:

@@ -27,7 +27,7 @@ dependencies = [
     "h5py",
     "pyyaml",
     "hydra-core>=1.1.0",
-    "torch>=2.5.0",
+    "torch==2.4.1",
     "pytorch-lightning>=2.0.0",
     "torchmetrics",
     "hydra-colorlog>=1.1.0",
@@ -44,9 +44,18 @@ dependencies = [
     "black[jupyter]",
     "protobuf",
     "progressbar",
-    "pytest",
     "petname",
+    "requests",
     "lmdb>=1.7.5",
+    "pyserial",
+    "pytest>=9.0.2",
+    "pytest-benchmark>=5.2.3",
+    "wandb>=0.23.1",
+    "rdkit>=2025.9.4",
+    "openbabel-wheel>=3.1.1.22",
+    "pandas>=2.3.3",
+    "cffi>=2.0.0",
+    "tblite[ase]>=0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +69,8 @@ script-files = [
     "src/scripts/spkpredict",
     "src/scripts/spkmd",
     "src/scripts/spkdeploy",
+    "src/scripts/spkdata",
+    "src/scripts/spk_general_deploy_model",
 ]
 
 [tool.setuptools.dynamic]
