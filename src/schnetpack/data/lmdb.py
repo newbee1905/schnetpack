@@ -39,6 +39,8 @@ class LMDBAtomsData(BaseAtomsData):
         )
 
         self._check_db()
+        self._metadata_cache = None
+        self._available_properties = None
 
         # initialize units
         md = self.metadata
@@ -119,12 +121,21 @@ class LMDBAtomsData(BaseAtomsData):
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        with self.env.begin() as txn:
-            return pickle.loads(txn.get(b"_metadata"))
+        # The metadata blob carries the full atomref tables and is ~400 kB for
+        # QM9. __getitem__ reaches it on every read via load_properties ->
+        # available_properties, so unpickling it per sample dominated the read
+        # path (35 ms/sample against 0.2 ms for the row itself). Cache it;
+        # the writers below invalidate.
+        if self._metadata_cache is None:
+            with self.env.begin() as txn:
+                self._metadata_cache = pickle.loads(txn.get(b"_metadata"))
+        return self._metadata_cache
 
     def _set_metadata(self, val: Dict[str, Any]):
         with self.env.begin(write=True) as txn:
             txn.put(b"_metadata", pickle.dumps(val))
+        self._metadata_cache = None
+        self._available_properties = None
 
     def update_metadata(self, **kwargs):
         assert all(
@@ -137,8 +148,11 @@ class LMDBAtomsData(BaseAtomsData):
 
     @property
     def available_properties(self) -> List[str]:
-        md = self.metadata
-        return list(md["_property_unit_dict"].keys())
+        if self._available_properties is None:
+            self._available_properties = list(
+                self.metadata["_property_unit_dict"].keys()
+            )
+        return self._available_properties
 
     @property
     def units(self) -> Dict[str, str]:
