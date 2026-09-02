@@ -509,6 +509,9 @@ class ASEAtomsData(BaseAtomsData):
         **properties,
     ):
         """Add systems to DB"""
+        if key_val is None:
+            key_val = {}
+
         if atoms is None:
             try:
                 Z = properties[structure.Z]
