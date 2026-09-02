@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+Download and build a dataset for an experiment, independently of training.
+
+`spktrain` builds its dataset inside the training run, which means every run
+re-checks (and, on a cold cache, re-downloads and re-converts) the data, and
+every run writes its own `split.npz` into its own hydra run directory. When you
+are comparing several training configurations you want the opposite: build the
+data once, freeze one split, and point every run at both.
+
+This script composes the *same* hydra config `spktrain` does, so the dataset and
+the transforms are identical to what the experiment would have produced, then
+runs `prepare_data()` (download + build) and `setup()` (partition + split file)
+and stops.
+
+Examples:
+    # build exactly what `spktrain experiment=qm9_atomwise` would build
+    spkdata experiment=qm9_atomwise run.data_dir=./data
+
+    # build a data config directly, without an experiment
+    spkdata data=qm9 run.data_dir=./data
+
+    # freeze a split shared by every run of a control experiment
+    spkdata experiment=qm9_atomwise run.data_dir=./data \
+        --split-file ./data/qm9_split_seed0.npz --seed 0
+
+    # then, for each configuration under test:
+    spktrain experiment=qm9_atomwise run.data_dir=./data \
+        data.split_file=$(realpath ./data/qm9_split_seed0.npz) ...
+
+    # report per-atom statistics of the training partition
+    spkdata experiment=qm9_atomwise run.data_dir=./data --stats energy_U0
+"""
+
+import argparse
+import logging
+import os
+import sys
+
+# registers the `uuid`, `petname` and `tmpdir` OmegaConf resolvers used by the
+# shared configs, so composing `train.yaml` here behaves as it does in spktrain
+import schnetpack.cli  # noqa: F401
+
+import hydra
+from hydra import compose, initialize_config_dir
+from hydra.core.hydra_config import HydraConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
+from pytorch_lightning import seed_everything
+
+import schnetpack as spk
+from schnetpack.data import load_dataset
+from schnetpack.utils import str2class
+from schnetpack.utils.script import print_config
+
+log = logging.getLogger("spkdata")
+
+CONFIG_DIR = os.path.join(os.path.dirname(spk.__file__), "configs")
+
+
+def build_argparser():
+    parser = argparse.ArgumentParser(
+        prog="spkdata",
+        description=(
+            "Download and build an experiment's dataset without training. "
+            "Any argument that is not one of the flags below is passed through "
+            "to hydra as a config override, e.g. `experiment=qm9_atomwise` or "
+            "`run.data_dir=./data`."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--split-file",
+        default=None,
+        help="Where to write the partition file. Overrides `data.split_file`. "
+        "Relative paths are resolved against the current directory, not the "
+        "hydra run directory, so the result is safe to share between runs. "
+        "Defaults to `<datapath stem>_split.npz` next to the dataset.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed used to draw the split. Pass the same seed to reproduce it.",
+    )
+    parser.add_argument(
+        "--no-split",
+        action="store_true",
+        help="Only download and build the dataset; do not partition it or write "
+        "a split file.",
+    )
+    parser.add_argument(
+        "--stats",
+        metavar="PROPERTY",
+        action="append",
+        default=[],
+        help="Compute mean/stddev of PROPERTY over the training partition. "
+        "Repeatable. Requires a full pass over the training data.",
+    )
+    parser.add_argument(
+        "--stats-total",
+        action="store_true",
+        help="Report --stats per system instead of per atom.",
+    )
+    parser.add_argument(
+        "--keep-atomrefs",
+        action="store_true",
+        help="Do not subtract atomrefs before computing --stats.",
+    )
+    parser.add_argument(
+        "--config-dir",
+        default=None,
+        help="Additional directory to search for configs, for your own "
+        "`experiment/<name>.yaml`. The current directory and `./configs` are "
+        "already searched.",
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="Print the resolved data config before building.",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List the available `data=` and `experiment=` config names and exit.",
+    )
+    return parser
+
+
+def list_configs():
+    for group in ("data", "experiment"):
+        group_dir = os.path.join(CONFIG_DIR, group)
+        names = sorted(
+            os.path.splitext(f)[0]
+            for f in os.listdir(group_dir)
+            if f.endswith(".yaml")
+        )
+        print(f"\n{group}=")
+        for name in names:
+            print(f"    {name}")
+    print()
+
+
+def compose_config(overrides, config_dir=None):
+    """Compose `train.yaml` exactly as spktrain does, minus the hydra.main wrapper.
+
+    `@hydra.main` would chdir into a fresh run directory and write logs there,
+    which is precisely what we do not want for a data-prep step. The compose API
+    gives the same config without those side effects, but it does not populate
+    `HydraConfig`, which `run.work_dir: ${hydra:runtime.cwd}` needs -- so we set
+    it explicitly.
+    """
+    # `train.yaml` puts `${oc.env:PWD}` on the config search path
+    os.environ.setdefault("PWD", os.getcwd())
+
+    if config_dir is not None:
+        searchpath = [
+            f"file://{os.path.abspath(config_dir)}",
+            "file://${oc.env:PWD}",
+            "file://${oc.env:PWD}/configs",
+        ]
+        overrides = overrides + [f"hydra.searchpath=[{','.join(searchpath)}]"]
+
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base="1.2"):
+        config = compose(
+            config_name="train",
+            overrides=overrides,
+            return_hydra_config=True,
+        )
+        # `set_config` takes a masked copy, so popping afterwards is safe
+        HydraConfig.instance().set_config(config)
+        with open_dict(config):
+            config.pop("hydra", None)
+        # resolve inside the context, while the resolvers still have what they need
+        OmegaConf.resolve(config)
+    return config
+
+
+def describe_dataset(dataset):
+    metadata = dataset.metadata or {}
+    print(f"  systems              : {len(dataset)}")
+    print(f"  distance unit        : {metadata.get('_distance_unit', '?')}")
+    atomrefs = dataset.atomrefs or {}
+    print("  properties           :")
+    units = dataset.units
+    for prop in dataset.available_properties:
+        unit = units.get(prop, "?")
+        ref = " (has atomrefs)" if prop in atomrefs else ""
+        print(f"      {prop:<32} [{unit}]{ref}")
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s"
+    )
+    parser = build_argparser()
+    args, overrides = parser.parse_known_args()
+
+    if args.list:
+        list_configs()
+        return 0
+
+    config: DictConfig = compose_config(overrides, config_dir=args.config_dir)
+
+    if "data" not in config or OmegaConf.is_missing(config.data, "datapath"):
+        parser.error(
+            "No dataset selected. Pass `experiment=<name>` or `data=<name>`, "
+            "and `run.data_dir=<dir>`. Run `spkdata --list` to see the options."
+        )
+
+    if args.seed is not None:
+        seed_everything(seed=args.seed, workers=True)
+        log.info(f"Seeded split with {args.seed}")
+    else:
+        log.warning(
+            "No --seed given; the split will not be reproducible. Pass --seed to "
+            "freeze a split you intend to reuse across training runs."
+        )
+
+    datapath = os.path.abspath(config.data.datapath)
+    os.makedirs(os.path.dirname(datapath) or ".", exist_ok=True)
+
+    # Keep the split file out of whatever directory this happens to run in.
+    if not args.no_split:
+        split_file = args.split_file or f"{os.path.splitext(datapath)[0]}_split.npz"
+        with open_dict(config):
+            config.data.split_file = os.path.abspath(split_file)
+
+    if args.print_config:
+        print_config(config.data, resolve=True)
+
+    log.info(f"Instantiating datamodule <{config.data._target_}>")
+    datamodule = hydra.utils.instantiate(
+        config.data,
+        train_sampler_cls=(
+            str2class(config.data.train_sampler_cls)
+            if config.data.get("train_sampler_cls")
+            else None
+        ),
+    )
+
+    existed = os.path.exists(datapath)
+    log.info(f"Preparing data at {datapath}" + (" (already present)" if existed else ""))
+    datamodule.prepare_data()
+
+    # the datamodule already ran the path through resolve_format in __init__
+    resolved_path = os.path.abspath(datamodule.datapath)
+    dataset = load_dataset(resolved_path, datamodule.format)
+
+    print("\n" + "=" * 72)
+    print(f"dataset: {resolved_path}")
+    print("=" * 72)
+    describe_dataset(dataset)
+
+    if args.no_split:
+        print("\nSplit skipped (--no-split).")
+        return 0
+
+    log.info("Partitioning dataset")
+    datamodule.setup("fit")
+
+    print("\n  partition sizes      :")
+    print(f"      train {len(datamodule.train_idx)}")
+    print(f"      val   {len(datamodule.val_idx)}")
+    print(f"      test  {len(datamodule.test_idx)}")
+    print(f"\n  split file           : {config.data.split_file}")
+
+    transforms = config.data.get("transforms") or []
+    if transforms:
+        print("  transforms           :")
+        for t in transforms:
+            print(f"      {t['_target_']}")
+
+    for prop in args.stats:
+        if prop not in dataset.available_properties:
+            log.error(f"`{prop}` is not in this dataset; skipping --stats for it.")
+            continue
+        remove_atomref = not args.keep_atomrefs and bool(
+            (datamodule.train_dataset.atomrefs or {}).get(prop) is not None
+        )
+        divide_by_atoms = not args.stats_total
+        log.info(f"Computing statistics for `{prop}` (one full pass over train)")
+        mean, stddev = datamodule.get_stats(
+            prop, divide_by_atoms=divide_by_atoms, remove_atomref=remove_atomref
+        )
+        scope = "per atom" if divide_by_atoms else "per system"
+        refs = "atomrefs removed" if remove_atomref else "atomrefs kept"
+        print(f"\n  stats[{prop}] ({scope}, {refs}):")
+        print(f"      mean   {mean.item():.6f}")
+        print(f"      stddev {stddev.item():.6f}")
+
+    print(
+        "\nReuse this build across training runs with:\n"
+        f"    spktrain <your overrides> run.data_dir={os.path.dirname(resolved_path)} "
+        f"data.split_file={config.data.split_file}\n"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

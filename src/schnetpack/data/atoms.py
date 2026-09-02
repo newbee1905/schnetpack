@@ -915,9 +915,12 @@ class LMDBAtomsData(BaseAtomsData):
         with env.begin(write=True) as txn:
             txn.put(b"metadata", pickle.dumps(metadata, protocol=pickle.HIGHEST_PROTOCOL))
             
-        # Create a temporary instance and give it a persistent writable connection
+        # Create a temporary instance and give it a persistent writable connection.
+        # __init__ deliberately leaves `env` as None so the read environment is
+        # opened lazily inside each worker, so there may be nothing to close.
         ds = LMDBAtomsData(datapath, **kwargs)
-        ds.env.close()
+        if ds.env is not None:
+            ds.env.close()
         
         # Re-open with writable access and map_size for subsequent additions
         ds.env = lmdb.open(
