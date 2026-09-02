@@ -61,6 +61,7 @@ script-files = [
     "src/scripts/spkpredict",
     "src/scripts/spkmd",
     "src/scripts/spkdeploy",
+    "src/scripts/spkdata",
 ]
 
 [tool.setuptools.dynamic]

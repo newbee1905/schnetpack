@@ -48,7 +48,8 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning import seed_everything
 
 import schnetpack as spk
-from schnetpack.data import load_dataset
+import schnetpack.properties as properties
+from schnetpack.data import AtomsDataFormat, create_dataset, load_dataset
 from schnetpack.utils import str2class
 from schnetpack.utils.script import print_config
 
@@ -106,6 +107,27 @@ def build_argparser():
         "--keep-atomrefs",
         action="store_true",
         help="Do not subtract atomrefs before computing --stats.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["ase", "lmdb", "both"],
+        default=None,
+        help="Which on-disk backend(s) to produce. Defaults to whatever the "
+        "config's `datapath` extension implies (.db=ase, .lmdb=lmdb). "
+        "`both` builds one and converts to the other, so the raw data is only "
+        "downloaded and parsed once.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="After building, time random-access and sequential reads on every "
+        "format that exists, and report the difference.",
+    )
+    parser.add_argument(
+        "--benchmark-n",
+        type=int,
+        default=2000,
+        help="Number of systems to read per benchmark phase (default 2000).",
     )
     parser.add_argument(
         "--config-dir",
@@ -176,6 +198,146 @@ def compose_config(overrides, config_dir=None):
     return config
 
 
+FORMATS = {"ase": AtomsDataFormat.ASE, "lmdb": AtomsDataFormat.LMDB}
+EXTENSIONS = {"ase": ".db", "lmdb": ".lmdb"}
+
+
+def path_for(datapath, fmt):
+    """Swap a datapath's extension for the one belonging to `fmt`."""
+    return os.path.splitext(datapath)[0] + EXTENSIONS[fmt]
+
+
+def convert_dataset(src_path, src_fmt, dst_path, dst_fmt, chunk=2000):
+    """Rewrite a built dataset into the other backend.
+
+    Reading the raw archive again is the expensive part of `prepare_data`, so
+    `--format both` builds one backend and converts, rather than downloading
+    and parsing twice.
+    """
+    from ase import Atoms
+
+    src = load_dataset(src_path, FORMATS[src_fmt])
+    props = list(src.available_properties)
+    dst = create_dataset(
+        datapath=dst_path,
+        format=FORMATS[dst_fmt],
+        distance_unit=(src.metadata or {}).get("_distance_unit", "Ang"),
+        property_unit_dict={p: src.units[p] for p in props},
+        atomrefs={k: list(v) for k, v in (src.atomrefs or {}).items()},
+    )
+
+    log.info(f"Converting {len(src)} systems {src_fmt} -> {dst_fmt}")
+    atoms_buf, prop_buf = [], []
+    written = 0
+    for i in range(len(src)):
+        row = src[i]
+        atoms_buf.append(
+            Atoms(
+                numbers=row[properties.Z].numpy(),
+                positions=row[properties.R].numpy(),
+                cell=row[properties.cell].numpy().reshape(3, 3),
+                pbc=row[properties.pbc].numpy(),
+            )
+        )
+        prop_buf.append({p: row[p].numpy() for p in props})
+        if len(prop_buf) >= chunk:
+            dst.add_systems(property_list=prop_buf, atoms_list=atoms_buf)
+            written += len(prop_buf)
+            log.info(f"  {written}/{len(src)}")
+            atoms_buf, prop_buf = [], []
+    if prop_buf:
+        dst.add_systems(property_list=prop_buf, atoms_list=atoms_buf)
+        written += len(prop_buf)
+
+    if hasattr(dst, "close"):
+        dst.close()
+
+    check = load_dataset(dst_path, FORMATS[dst_fmt])
+    if len(check) != len(src):
+        raise RuntimeError(
+            f"conversion wrote {len(check)} systems, source has {len(src)}"
+        )
+    log.info(f"Converted {written} systems -> {dst_path}")
+
+
+def dir_size(path):
+    """LMDB may be a directory; ASE is a single file."""
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def benchmark_formats(paths, n_samples, seed=0):
+    """Time random-access and sequential reads on each built backend."""
+    import random
+    import time
+
+    rows = []
+    for fmt, path in paths.items():
+        ds = load_dataset(path, FORMATS[fmt])
+        total = len(ds)
+        n = min(n_samples, total)
+
+        # touch a few rows first so we are not timing one-off env/connection setup
+        for i in range(min(32, total)):
+            ds[i]
+
+        rng = random.Random(seed)
+        idx = [rng.randrange(total) for _ in range(n)]
+        t0 = time.perf_counter()
+        for i in idx:
+            ds[i]
+        t_rand = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for i in range(n):
+            ds[i]
+        t_seq = time.perf_counter() - t0
+
+        rows.append(
+            {
+                "fmt": fmt,
+                "path": path,
+                "n": n,
+                "size": dir_size(path),
+                "rand_s": t_rand,
+                "seq_s": t_seq,
+                "rand_rate": n / t_rand if t_rand else float("inf"),
+                "seq_rate": n / t_seq if t_seq else float("inf"),
+            }
+        )
+
+    print()
+    print("=" * 72)
+    print(f"read benchmark ({rows[0]['n']} systems per phase, warm page cache)")
+    print("=" * 72)
+    print(f"  {'backend':<8}{'on disk':>12}{'random/s':>14}{'sequential/s':>16}")
+    for r in rows:
+        print(
+            f"  {r['fmt']:<8}{r['size']/1e6:>10.1f} MB"
+            f"{r['rand_rate']:>14,.0f}{r['seq_rate']:>16,.0f}"
+        )
+
+    if len(rows) == 2:
+        a, b = rows
+        print()
+        print(
+            f"  {b['fmt']} vs {a['fmt']}: "
+            f"random {b['rand_rate']/a['rand_rate']:.2f}x, "
+            f"sequential {b['seq_rate']/a['seq_rate']:.2f}x, "
+            f"size {b['size']/a['size']:.2f}x"
+        )
+    print(
+        "\n  Note: warm page cache, single process, no transforms. Real training\n"
+        "  throughput also depends on transforms, batch size and worker count."
+    )
+    return rows
+
+
 def describe_dataset(dataset):
     metadata = dataset.metadata or {}
     print(f"  systems              : {len(dataset)}")
@@ -220,6 +382,21 @@ def main():
     datapath = os.path.abspath(config.data.datapath)
     os.makedirs(os.path.dirname(datapath) or ".", exist_ok=True)
 
+    # Which backend(s) to end up with. Default: whatever the config's extension
+    # says. `both` builds one and converts, so parsing happens once.
+    config_fmt = "lmdb" if datapath.endswith(".lmdb") else "ase"
+    if args.format is None:
+        wanted = [config_fmt]
+    elif args.format == "both":
+        wanted = [config_fmt, "lmdb" if config_fmt == "ase" else "ase"]
+    else:
+        wanted = [args.format]
+
+    primary = wanted[0]
+    datapath = path_for(datapath, primary)
+    with open_dict(config):
+        config.data.datapath = datapath
+
     # Keep the split file out of whatever directory this happens to run in.
     if not args.no_split:
         split_file = args.split_file or f"{os.path.splitext(datapath)[0]}_split.npz"
@@ -247,10 +424,23 @@ def main():
     resolved_path = os.path.abspath(datamodule.datapath)
     dataset = load_dataset(resolved_path, datamodule.format)
 
-    print("\n" + "=" * 72)
-    print(f"dataset: {resolved_path}")
-    print("=" * 72)
-    describe_dataset(dataset)
+    built = {primary: resolved_path}
+    for fmt in wanted[1:]:
+        target = path_for(resolved_path, fmt)
+        if os.path.exists(target):
+            log.info(f"{fmt} dataset already present at {target}")
+        else:
+            convert_dataset(resolved_path, primary, target, fmt)
+        built[fmt] = target
+
+    for fmt, path in built.items():
+        print("\n" + "=" * 72)
+        print(f"dataset [{fmt}]: {path}")
+        print("=" * 72)
+        describe_dataset(load_dataset(path, FORMATS[fmt]))
+
+    if args.benchmark:
+        benchmark_formats(built, args.benchmark_n)
 
     if args.no_split:
         print("\nSplit skipped (--no-split).")
