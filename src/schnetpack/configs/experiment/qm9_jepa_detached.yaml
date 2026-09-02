@@ -44,7 +44,6 @@ model:
     _target_: schnetpack.atomistic.jepa.PaiNNLatentPredictor
     n_atom_basis: ${model.representation.n_atom_basis}
     n_layers: 3
-    kan_degree: null
     use_glu_variant: True
   output_modules:
     - _target_: schnetpack.atomistic.jepa.JEPAGeometryOutput

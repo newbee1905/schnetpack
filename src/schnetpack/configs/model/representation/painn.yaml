@@ -12,4 +12,3 @@ cutoff_fn:
 
 use_glu_variant: True
 use_norm: True
-kan_degree: null

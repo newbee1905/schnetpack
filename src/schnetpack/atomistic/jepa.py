@@ -89,7 +89,6 @@ class PaiNNLatentPredictor(nn.Module):
         self,
         n_atom_basis: int,
         n_layers: int = 3,
-        kan_degree: Optional[int] = None,
         use_glu_variant: bool = False,
         activation: Callable = nn.SiLU(),
     ):
@@ -97,44 +96,26 @@ class PaiNNLatentPredictor(nn.Module):
         input_dim = 2 * n_atom_basis  # q + ||mu||
 
         # Initial projection to hidden space
-        if kan_degree is not None:
-            self.pre_lin = nn.Sequential(
-                snn.ShiftedChebyKANLayer(input_dim, n_atom_basis * 2, kan_degree),
-                activation,
-            )
-        else:
-            self.pre_lin = snn.Dense(
-                input_dim,
-                n_atom_basis * 2,
-                activation=activation,
-                use_glu_variant=use_glu_variant,
-            )
+        self.pre_lin = snn.Dense(
+            input_dim,
+            n_atom_basis * 2,
+            activation=activation,
+            use_glu_variant=use_glu_variant,
+        )
 
         # Residual Denoising Blocks
         self.res_blocks = nn.ModuleList()
         for _ in range(n_layers):
-            if kan_degree is not None:
-                block = nn.Sequential(
-                    snn.ShiftedChebyKANLayer(
-                        n_atom_basis * 2, n_atom_basis * 2, kan_degree
-                    ),
-                    nn.LayerNorm(n_atom_basis * 2),
-                    activation,
-                    snn.ShiftedChebyKANLayer(
-                        n_atom_basis * 2, n_atom_basis * 2, kan_degree
-                    ),
-                )
-            else:
-                block = nn.Sequential(
-                    snn.Dense(
-                        n_atom_basis * 2,
-                        n_atom_basis * 2,
-                        activation=activation,
-                        use_glu_variant=use_glu_variant,
-                    ),
-                    nn.LayerNorm(n_atom_basis * 2),
-                    snn.Dense(n_atom_basis * 2, n_atom_basis * 2, activation=None),
-                )
+            block = nn.Sequential(
+                snn.Dense(
+                    n_atom_basis * 2,
+                    n_atom_basis * 2,
+                    activation=activation,
+                    use_glu_variant=use_glu_variant,
+                ),
+                nn.LayerNorm(n_atom_basis * 2),
+                snn.Dense(n_atom_basis * 2, n_atom_basis * 2, activation=None),
+            )
             self.res_blocks.append(block)
 
     def forward(self, q: torch.Tensor, mu: Optional[torch.Tensor]):
@@ -238,7 +219,7 @@ class JEPAGeometryOutput(ModelOutput):
 
         # Use LayerNorm for fixed unit-scale normalization
         self.norm = nn.LayerNorm(n_atom_basis)
-        self.vnorm = snn.EquivariantLayerNorm(n_atom_basis, add_unit_offset=True)
+        self.vnorm = snn.EquivariantRMSNorm(n_atom_basis, add_unit_offset=True)
 
         if mlp_spec:
             self.projector = Projector(mlp_spec)

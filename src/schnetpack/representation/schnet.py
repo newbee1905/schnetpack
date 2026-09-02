@@ -20,7 +20,6 @@ class SchNetInteraction(nn.Module):
         n_rbf: int,
         n_filters: int,
         activation: Callable = shifted_softplus,
-        kan_degree: Optional[int] = None,
     ):
         """
         Args:
@@ -28,27 +27,18 @@ class SchNetInteraction(nn.Module):
             n_rbf (int): number of radial basis functions.
             n_filters: number of filters used in continuous-filter convolution.
             activation: if None, no activation function is used.
-            kan_degree: degree of the shifted Chebyshev polynomials for KAN layers.
         """
         super(SchNetInteraction, self).__init__()
         self.in2f = Dense(n_atom_basis, n_filters, bias=False, activation=None)
 
-        if kan_degree is not None:
-            self.f2out = snn.ShiftedChebyKANLayer(
-                n_filters, n_atom_basis, kan_degree
-            )
-            self.filter_network = snn.ShiftedChebyKANLayer(
-                n_rbf, n_filters, kan_degree
-            )
-        else:
-            self.f2out = nn.Sequential(
-                Dense(n_filters, n_atom_basis, activation=activation),
-                Dense(n_atom_basis, n_atom_basis, activation=None),
-            )
-            self.filter_network = nn.Sequential(
-                Dense(n_rbf, n_filters, activation=activation),
-                Dense(n_filters, n_filters),
-            )
+        self.f2out = nn.Sequential(
+            Dense(n_filters, n_atom_basis, activation=activation),
+            Dense(n_atom_basis, n_atom_basis, activation=None),
+        )
+        self.filter_network = nn.Sequential(
+            Dense(n_rbf, n_filters, activation=activation),
+            Dense(n_filters, n_filters),
+        )
 
     def forward(
         self,
@@ -111,7 +101,6 @@ class SchNet(nn.Module):
         activation: Union[Callable, nn.Module] = shifted_softplus,
         nuclear_embedding: Optional[nn.Module] = None,
         electronic_embeddings: Optional[List] = None,
-        kan_degree: Optional[int] = None,
     ):
         """
         Args:
@@ -127,7 +116,6 @@ class SchNet(nn.Module):
             nuclear_embedding: custom nuclear embedding (e.g. spk.nn.embeddings.NuclearEmbedding)
             electronic_embeddings: list of electronic embeddings. E.g. for spin and
                 charge (see spk.nn.embeddings.ElectronicEmbedding)
-            kan_degree: degree of the shifted Chebyshev polynomials for KAN layers.
         """
         super().__init__()
         self.n_atom_basis = n_atom_basis
@@ -153,7 +141,6 @@ class SchNet(nn.Module):
                 n_rbf=self.radial_basis.n_rbf,
                 n_filters=self.n_filters,
                 activation=activation,
-                kan_degree=kan_degree,
             ),
             n_interactions,
             shared_interactions,
