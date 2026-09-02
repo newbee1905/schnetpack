@@ -1,5 +1,6 @@
 import io
 import logging
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -692,9 +693,32 @@ class QM9(AtomsDataModule):
             "worker_error": 0,
         }
 
-        for task in tqdm(tasks, desc="Processing molecules"):
-            original_idx, final_ats, props, skip_reason = _optimize_molecule_worker(task)
+        # The SMILES/optimisation path is CPU-bound (OpenBabel build + MMFF94
+        # relaxation + an RDKit isomorphism search per molecule), so fan it out
+        # across processes when more than one worker is configured. The worker
+        # is a module-level function taking and returning plain tuples, so it
+        # pickles cleanly.
+        n_proc = max(1, int(self.num_workers or 1))
+        needs_work = self.use_smiles or self.optimize_geometries
 
+        if n_proc > 1 and needs_work:
+            logging.info(f"Processing {len(tasks)} molecules across {n_proc} processes")
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=n_proc) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap(_optimize_molecule_worker, tasks, chunksize=64),
+                        total=len(tasks),
+                        desc="Processing molecules",
+                    )
+                )
+        else:
+            results = [
+                _optimize_molecule_worker(task)
+                for task in tqdm(tasks, desc="Processing molecules")
+            ]
+
+        for original_idx, final_ats, props, skip_reason in results:
             if final_ats is None:  # Worker signaled an error (or skip)
                 if skip_reason:
                     skip_stats[skip_reason] += 1
