@@ -198,6 +198,43 @@ These can be selected as follows:
 spktrain experiment=md17 logger=csv
 ```
 
+### Deploying a trained model
+
+When installing SchNetPack, the deployment script `spkdeploy` is added to your PATH.
+It compiles a model stored by a training run into a TorchScript archive, which can be loaded with
+`torch.jit.load` and evaluated without SchNetPack being installed.
+This is what you hand to the LAMMPS interface, or ship to a machine that only has PyTorch on it.
+
+A model written by a training run can be deployed by:
+
+```
+spkdeploy <rundir>/best_model model.script
+```
+
+The first argument is the model produced by the run, the second is the archive to create.
+The cutoff is stored alongside the weights as metadata, so consumers do not need the training config
+in order to build neighbor lists.
+By default the model is loaded onto the CPU, which can be changed as follows:
+
+```
+spkdeploy <rundir>/best_model model.script --device cuda
+```
+
+The postprocessors that cast between float32 and float64 are dropped while compiling, because the
+LAMMPS interface expects float32.
+This costs a little accuracy whenever the model adds atomic reference energies back onto its
+prediction: those offsets are of the order of 1e4 eV for a QM9 molecule, where float32 resolves to
+roughly 1 meV.
+If the deployed model is meant for inference rather than for LAMMPS, the casts can be kept:
+
+```
+spkdeploy <rundir>/best_model model.script --keep-float64
+```
+
+The resulting archive reproduces the original model exactly and returns float64.
+Note that a model without a response module does not predict forces and can therefore not drive a
+LAMMPS simulation in the first place, so this is the better choice for such models.
+
 ## LAMMPS interface
 
 SchNetPack comes with an interface to LAMMPS. A detailed installation guide is linked in the [How-To section of our documentation](https://schnetpack.readthedocs.io/en/latest/howtos/lammps.html).
