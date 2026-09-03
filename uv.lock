@@ -914,6 +914,19 @@ wheels = [
 ]
 
 [[package]]
+name = "openbabel"
+version = "3.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/ee/946ca33e35e47fc634d9f62f6a74505318a651de720495ae42c6307551e7/openbabel-3.2.1.tar.gz", hash = "sha256:3afad3decd3b4343e09af3d98472b72f84cbf9a0fa25c2e4eb102abc334548c3", size = 36477455, upload-time = "2026-07-11T20:41:56.503Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/76/6f9a9f5514229077d8d8142ac81d0171e1976ddb85a18917261c7188566f/openbabel-3.2.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:1de881a1a138ef7cbc87d6b69fa55bc6803d76c69dcb9c38828c31056b52d3de", size = 10992096, upload-time = "2026-07-11T20:41:22.681Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/53/574a2b10d5c7b3df5f84041ab97bbbc351c489b26883f865e99ee7c8fbde/openbabel-3.2.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:c5785ccc30b0405890e037f4d7652cc12df2909be092aef5eabc9dd4c5d01848", size = 10554004, upload-time = "2026-07-11T20:41:25.374Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/af/4dd25ef6437ee6e49cb2697538b327df5fda90f20177f03453ed6f0b414a/openbabel-3.2.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:dcb76ec05be8789cab24229e6a8b8b369ffb72e8fc0fa0f570e6420b579af62c", size = 12073509, upload-time = "2026-07-11T20:41:27.756Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/37/e5c54fbe0d3c9ba17e1f8332631757cbffe727d82a0b290e82e67e3566ea/openbabel-3.2.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:bdaceaa9c6d14cae08594d535b81745eb6b5850007f87599c3495bf500f292c8", size = 12645682, upload-time = "2026-07-11T20:41:29.946Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/b0/9fbad1c10263c15debda2fecf08e7ee908bcdbf8eedf0280bbf669e2bd32/openbabel-3.2.1-cp312-cp312-win_amd64.whl", hash = "sha256:44910a1ee4576a3a0b8ca14f23617b7f191b5d89b3643493bb4d1463195bd978", size = 5508269, upload-time = "2026-07-11T20:41:31.982Z" },
+]
+
+[[package]]
 name = "openbabel-wheel"
 version = "3.1.1.23"
 source = { registry = "https://pypi.org/simple" }
@@ -1386,6 +1399,7 @@ dependencies = [
     { name = "lmdb" },
     { name = "matscipy" },
     { name = "numpy" },
+    { name = "openbabel" },
     { name = "openbabel-wheel" },
     { name = "pandas" },
     { name = "petname" },
@@ -1432,6 +1446,7 @@ requires-dist = [
     { name = "lmdb", specifier = ">=1.7.5" },
     { name = "matscipy", specifier = ">=1.1.0" },
     { name = "numpy", specifier = ">=2.0.0" },
+    { name = "openbabel", specifier = ">=3.2.1" },
     { name = "openbabel-wheel", specifier = ">=3.1.1.22" },
     { name = "pandas", specifier = ">=2.3.3" },
     { name = "petname" },

@@ -117,7 +117,7 @@ env/
 .mypy_cache/
 
 # experiments
-runs/
+/runs/
 tests/testdata/tmp/test*
 
 # lammps examples
@@ -129,3 +129,9 @@ interfaces/lammps/examples/*/deployed_model
 
 # batchwise optimizer examples
 examples/howtos/howto_batchwise_relaxations_outputs/*
+
+# local experiment scratch
+/data/
+/runs/
+/splitting.lock
+.claude/settings.local.json
