@@ -188,13 +188,13 @@ def _optimize_molecule_worker(task_data):
 
                 except Exception as e:
                     logging.warning(f"RDKit Alignment failed for molecule {idx}: {e}. Skipping molecule.")
-                    return idx, None, None, "alignment_failed"
+                    return idx, original_ats, properties, "alignment_failed"
 
         except Exception as e:
             logging.warning(
                 f"SMILES conversion failed for molecule {idx}. Error: {e}. Skipping molecule."
             )
-            return idx, None, None, "smiles_failed"
+            return idx, original_ats, properties, "smiles_failed"
 
     if optimize_geometries_flag:
         try:
@@ -235,18 +235,21 @@ def _optimize_molecule_worker(task_data):
             logging.warning(
                 f"OpenBabel optimization failed for molecule {idx}. Error: {e}. Skipping molecule."
             )
-            return idx, None, None, "opt_failed"
+            return idx, original_ats, properties, "opt_failed"
 
     if np.isnan(final_ats.positions).any():
-        logging.warning(f"Molecule {idx} contains NaN positions/distances. Skipping molecule.")
-        return idx, None, None, "nan"
+        logging.warning(f"Molecule {idx} has NaN positions; flagging geometry invalid.")
+        return idx, original_ats, properties, "nan"
 
     if distance_threshold > 0:
         dm = final_ats.get_all_distances()
         np.fill_diagonal(dm, np.inf)
         if np.any(dm < distance_threshold):
-            logging.warning(f"Molecule {idx} contains atoms too close (<{distance_threshold}A). Skipping molecule.")
-            return idx, None, None, "distance"
+            logging.warning(
+                f"Molecule {idx} has atoms closer than {distance_threshold} A; "
+                f"flagging geometry invalid."
+            )
+            return idx, original_ats, properties, "distance"
 
     return idx, final_ats, properties, None
 
@@ -275,6 +278,11 @@ class QM9(AtomsDataModule):
         "atomrefs": "3195395",
         "uncharacterized": "3195404",
     }
+
+    # marks whether the stored geometry is usable (SMILES builds only)
+    geometry_valid = "geometry_valid"
+    # metadata key holding row indices whose geometry is unusable
+    invalid_geometry_key = "invalid_geometry_idx"
 
     # properties
     A = "rotational_constant_A"
@@ -541,6 +549,10 @@ class QM9(AtomsDataModule):
         }
         if self.store_both_geometries:
             property_unit_dict["R_real"] = "Ang"
+        # Rows whose SMILES geometry could not be built are still written, so
+        # this dataset stays index-parallel with the plain QM9 build. The flag
+        # marks which geometries are usable; the split drops the rest.
+        property_unit_dict[QM9.geometry_valid] = ""
 
         tmpdir = tempfile.mkdtemp("qm9")
         atomrefs = self._download_atomrefs(tmpdir)
@@ -718,18 +730,25 @@ class QM9(AtomsDataModule):
                 for task in tqdm(tasks, desc="Processing molecules")
             ]
 
-        for original_idx, final_ats, props, skip_reason in results:
-            if final_ats is None:  # Worker signaled an error (or skip)
-                if skip_reason:
-                    skip_stats[skip_reason] += 1
-                else:
-                    skip_stats["worker_error"] += 1
-                    logging.error(
-                        f"Worker failed to process molecule {original_idx}. Skipping this molecule."
-                    )
-                continue
+        invalid_idx = []
+        for row, (original_idx, final_ats, props, skip_reason) in enumerate(results):
+            if final_ats is None or props is None:
+                # Dropping a row here would break index parity with the plain
+                # QM9 build, which is the whole point of keeping them.
+                skip_stats["worker_error"] += 1
+                raise AtomsDataModuleError(
+                    f"Worker returned nothing for molecule {original_idx}; cannot "
+                    f"keep this dataset index-parallel with the plain QM9 build."
+                )
+
+            if skip_reason:
+                skip_stats[skip_reason] += 1
+                invalid_idx.append(row)
 
             properties = props
+            properties[QM9.geometry_valid] = np.array(
+                [0.0 if skip_reason else 1.0], dtype=np.float64
+            )
             properties[structure.Z] = final_ats.numbers
             properties[structure.R] = final_ats.positions
             
@@ -744,12 +763,18 @@ class QM9(AtomsDataModule):
         property_list = collected_properties
 
         if sum(skip_stats.values()) > 0:
-            logging.info("QM9 Data Filtering Report:")
+            logging.info("QM9 geometry report:")
             for reason, count in skip_stats.items():
                 if count > 0:
-                    logging.info(f"  - {reason}: {count} molecules filtered")
-            logging.info(f"Total molecules filtered: {sum(skip_stats.values())}")
+                    logging.info(f"  - {reason}: {count} molecules flagged invalid")
+            logging.info(
+                f"Total flagged invalid: {sum(skip_stats.values())} "
+                f"(kept in the dataset, excluded at split time)"
+            )
 
         logging.info("Write atoms to db...")
         dataset.add_systems(property_list=property_list)
-        logging.info("Done.")
+        # Record unusable rows in dataset metadata so a split can exclude them
+        # without a side-car mapping file.
+        dataset.update_metadata(**{QM9.invalid_geometry_key: invalid_idx})
+        logging.info(f"Done. {len(invalid_idx)} rows flagged invalid.")
