@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import torch
 import torch.nn as nn
 from schnetpack.transform import CastTo64, CastTo32, AddOffsets
@@ -14,20 +15,40 @@ import argparse
 
 
 def get_jit_model(model):
-    # fix invalid operations in postprocessing
+    """Script `model`, leaving the caller's model untouched.
+
+    Scripting needs a postprocessor list with the type casts dropped and the
+    offset mean in float32. Both of those used to be written straight onto the
+    caller's model: `model.postprocessors` was replaced, and AddOffsets.mean was
+    downcast on the shared postprocessor object. The CLI never noticed because
+    it exits immediately afterwards, but anything that keeps using the model --
+    evaluating it, or deploying several checkpoints in a loop -- silently got a
+    model that had lost CastTo64 and returned float32.
+
+    So: copy the postprocessor being modified rather than editing it in place,
+    and restore the original list once scripting is done. Only the postprocessor
+    is copied, not the whole model, so this costs nothing for a large network.
+    """
+    original_postprocessors = model.postprocessors
+
     jit_postprocessors = nn.ModuleList()
-    for postprocessor in model.postprocessors:
+    for postprocessor in original_postprocessors:
         # ignore type casting
         if type(postprocessor) in [CastTo64, CastTo32]:
             continue
-        # ensure offset mean is float
+        # ensure offset mean is float, on a copy so the caller's model keeps
+        # its float64 mean
         if type(postprocessor) == AddOffsets:
+            postprocessor = copy.deepcopy(postprocessor)
             postprocessor.mean = postprocessor.mean.float()
 
         jit_postprocessors.append(postprocessor)
-    model.postprocessors = jit_postprocessors
 
-    return torch.jit.script(model)
+    model.postprocessors = jit_postprocessors
+    try:
+        return torch.jit.script(model)
+    finally:
+        model.postprocessors = original_postprocessors
 
 
 def save_jit_model(model, model_path):
