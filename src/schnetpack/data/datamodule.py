@@ -191,10 +191,43 @@ class AtomsDataModule(pl.LightningDataModule):
                 self._load_partitions()
 
             # partition dataset
-            self._train_dataset = self.dataset.subset(self.train_idx)
-            self._val_dataset = self.dataset.subset(self.val_idx)
-            self._test_dataset = self.dataset.subset(self.test_idx)
+            self._train_dataset = self.dataset.subset(
+                self._drop_invalid_geometries(self.train_idx, "train")
+            )
+            self._val_dataset = self.dataset.subset(
+                self._drop_invalid_geometries(self.val_idx, "val")
+            )
+            self._test_dataset = self.dataset.subset(
+                self._drop_invalid_geometries(self.test_idx, "test")
+            )
             self._setup_transforms()
+
+    def _drop_invalid_geometries(self, idx: List[int], partition: str) -> List[int]:
+        """Filter rows the dataset marks as having an unusable geometry.
+
+        Datasets built from generated (rather than measured) geometries keep the
+        failed rows in place so that their index space stays identical to the
+        reference build -- that is what lets both share a split file. The rows
+        exist to keep the splitting aligned, not to be trained on, so they are
+        dropped here, between the split and the DataLoader, and never reach the
+        model.
+
+        A no-op for any dataset whose metadata does not carry the key.
+        """
+        md = getattr(self.dataset, "metadata", None) or {}
+        invalid = md.get("invalid_geometry_idx")
+        if not invalid:
+            return idx
+
+        invalid = set(invalid)
+        kept = [i for i in idx if i not in invalid]
+        n_dropped = len(idx) - len(kept)
+        if n_dropped:
+            logging.info(
+                f"{partition}: skipping {n_dropped} of {len(idx)} rows flagged with an "
+                f"unusable geometry; {len(kept)} remain"
+            )
+        return kept
 
     def _copy_to_workdir(self):
         """
