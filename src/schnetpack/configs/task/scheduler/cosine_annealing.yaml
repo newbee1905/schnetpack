@@ -1,0 +1,11 @@
+# @package task
+#
+# Fixed-length cosine decay. Unlike reduce_on_plateau this does not react to
+# the loss curve, so two runs with the same budget follow the identical LR
+# schedule -- which is what makes them comparable. T_max must match
+# trainer.max_epochs; the scheduler steps once per epoch.
+scheduler_cls: torch.optim.lr_scheduler.CosineAnnealingLR
+scheduler_monitor: null
+scheduler_args:
+  T_max: ${globals.max_epochs}
+  eta_min: 1e-6

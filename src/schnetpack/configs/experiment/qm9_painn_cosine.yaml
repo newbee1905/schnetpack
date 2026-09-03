@@ -1,0 +1,92 @@
+# @package _global_
+#
+# PaiNN on QM9 with the real (DFT) geometries, on a fixed 100-epoch cosine
+# schedule.
+#
+# This is deliberately NOT the reference PaiNN recipe. Upstream trains to
+# exhaustion with ReduceLROnPlateau (max_epochs 100000, early-stopping patience
+# 200), which is what produces the published ~5 meV numbers but takes far too
+# long to iterate on. A fixed budget with a fixed LR curve trades final accuracy
+# for two things this comparison needs:
+#
+#   - both runs see the identical LR at every step, so a difference between them
+#     is attributable to the data rather than to the schedule reacting to one
+#     loss curve earlier than the other
+#   - the run ends when it says it will
+#
+# Expect MAE well above the literature value. Use it to rank configurations,
+# not to quote accuracy.
+#
+# Paired with qm9_painn_smiles_cosine.yaml, which is this file with the
+# OpenBabel/SMILES geometries swapped in. Run both with +seed=0.
+
+defaults:
+  - override /model: nnp
+  - override /model/representation: painn
+  - override /data: qm9
+  - override /task/scheduler: cosine_annealing
+  # fixed budget: drop early stopping entirely rather than defusing it with a
+  # large patience, so the only thing controlling the LR is the cosine curve
+  - override /callbacks:
+      - checkpoint
+      - lrmonitor
+      - ema
+
+run:
+  experiment: painn_qm9_real_cos_${globals.property}
+
+globals:
+  cutoff: 5.
+  lr: 5e-4
+  max_epochs: 100
+  property: free_energy
+  aggregation: sum
+
+trainer:
+  max_epochs: ${globals.max_epochs}
+  strategy: auto
+
+data:
+  datapath: ${run.data_dir}/qm9.lmdb
+  batch_size: 100
+  num_workers: 4
+  # plain RandomSplit over the full 130831-row index space. Both builds have the
+  # same length, so the same seed gives the same partition and molecule i is the
+  # same molecule on both sides -- no cross-dataset exclusion list needed. The
+  # SMILES build's unusable rows are skipped by the datamodule at load time.
+  transforms:
+    - _target_: schnetpack.transform.SubtractCenterOfMass
+    - _target_: schnetpack.transform.RemoveOffsets
+      property: ${globals.property}
+      remove_atomrefs: True
+      remove_mean: True
+    - _target_: schnetpack.transform.MatScipyNeighborList
+      cutoff: ${globals.cutoff}
+    - _target_: schnetpack.transform.CastTo32
+
+model:
+  output_modules:
+    - _target_: schnetpack.atomistic.Atomwise
+      output_key: ${globals.property}
+      n_in: ${model.representation.n_atom_basis}
+      aggregation_mode: ${globals.aggregation}
+  postprocessors:
+    - _target_: schnetpack.transform.CastTo64
+    - _target_: schnetpack.transform.AddOffsets
+      property: ${globals.property}
+      add_mean: True
+      add_atomrefs: True
+
+task:
+  outputs:
+    - _target_: schnetpack.task.ModelOutput
+      name: ${globals.property}
+      loss_fn:
+        _target_: torch.nn.MSELoss
+      metrics:
+        mae:
+          _target_: torchmetrics.regression.MeanAbsoluteError
+        rmse:
+          _target_: torchmetrics.regression.MeanSquaredError
+          squared: False
+      loss_weight: 1.
