@@ -31,16 +31,18 @@ class LMDBAtomsData(BaseAtomsData):
         self._env = None
         self._env_pid = None
 
+        # must precede super().__init__: setting `load_properties` there reaches
+        # `available_properties`, which reads these caches.
+        self._check_db()
+        self._metadata_cache = None
+        self._available_properties = None
+
         super().__init__(
             load_properties=load_properties,
             load_structure=load_structure,
             transforms=transforms,
             subset_idx=subset_idx,
         )
-
-        self._check_db()
-        self._metadata_cache = None
-        self._available_properties = None
 
         # initialize units
         md = self.metadata
@@ -132,8 +134,22 @@ class LMDBAtomsData(BaseAtomsData):
         return self._metadata_cache
 
     def _set_metadata(self, val: Dict[str, Any]):
-        with self.env.begin(write=True) as txn:
-            txn.put(b"_metadata", pickle.dumps(val))
+        # `self.env` is opened read-only (it is shared with the dataloader
+        # workers), so writes need their own handle, exactly as add_systems does.
+        env = lmdb.open(
+            self.datapath,
+            subdir=False,
+            map_size=10995111627776 * 2,  # 2TB
+            readonly=False,
+            lock=False,
+            readahead=False,
+            meminit=False,
+        )
+        try:
+            with env.begin(write=True) as txn:
+                txn.put(b"_metadata", pickle.dumps(val))
+        finally:
+            env.close()
         self._metadata_cache = None
         self._available_properties = None
 
